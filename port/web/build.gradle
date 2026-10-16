@@ -1,0 +1,46 @@
+plugins{
+    id 'java'
+    id 'org.teavm' version '0.16.0'
+}
+
+repositories{
+    mavenCentral()
+}
+
+// SRC points at the folder holding the patched Mindustry, Arc and rhino checkouts (see ../build.sh)
+def src = file(System.getenv("SRC") ?: "../src")
+
+dependencies{
+    implementation fileTree("$src/Mindustry/core/build/libs"){ include 'core-release.jar' }
+    implementation files(
+        "$src/Arc/arc-core/build/libs/arc-core-1.0.jar",
+        "$src/Arc/extensions/freetype/build/libs/freetype-1.0.jar",
+        "$src/Arc/extensions/flabel/build/libs/flabel-1.0.jar",
+        "$src/Arc/extensions/g3d/build/libs/g3d-1.0.jar",
+        "$src/Arc/extensions/fx/build/libs/fx-1.0.jar",
+        "$src/Arc/extensions/arcnet/build/libs/arcnet-1.0.jar",
+        "$src/rhino/build/libs/rhino-1.7.13-SNAPSHOT.jar"
+    )
+    implementation 'at.yawk.lz4:lz4-java:1.10.2'
+    implementation teavm.libs.jsoApis
+    compileOnly teavm.libs.interop
+    compileOnly "org.teavm:teavm-core:0.16.0"
+    compileOnly "org.teavm:teavm-classlib:0.16.0"
+    compileOnly "org.teavm:teavm-extension-spi:0.16.0"
+}
+
+java{
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+teavm{
+    js{
+        mainClass = 'mindustry.web.WebLauncher'
+        targetFileName = 'mindustry.js'
+        obfuscated = !project.hasProperty('debugJs')
+        sourceMap = project.hasProperty('debugJs')
+        optimization = org.teavm.gradle.api.OptimizationLevel.BALANCED
+        processMemory = 6000
+    }
+}
