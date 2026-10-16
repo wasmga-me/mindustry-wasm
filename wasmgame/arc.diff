@@ -1,0 +1,83 @@
+diff --git a/arc-core/src/arc/audio/Music.java b/arc-core/src/arc/audio/Music.java
+index 08e40e6..fbe3c4c 100644
+--- a/arc-core/src/arc/audio/Music.java
++++ b/arc-core/src/arc/audio/Music.java
+@@ -3,6 +3,7 @@ package arc.audio;
+ import arc.*;
+ import arc.Files.*;
+ import arc.files.*;
++import arc.func.*;
+ import arc.util.*;
+ 
+ import java.io.*;
+@@ -30,6 +31,9 @@ import static arc.audio.Soloud.*;
+  * @author mzechner
+  */
+ public class Music extends AudioSource{
++    /** Set by the browser build: fetches the file in the background, then calls {@link #load(byte[])}. */
++    public static @Nullable Cons2<Music, Fi> webLoader;
++
+     public @Nullable Fi file;
+ 
+     int voice = -1;
+@@ -65,6 +69,11 @@ public class Music extends AudioSource{
+     public void load(Fi file) throws Exception{
+         this.file = file;
+ 
++        if(webLoader != null){
++            webLoader.get(this, file);
++            return;
++        }
++
+         //on iOS, try to load from internal storage instead, as that prevents unnecessary copies
+         if(OS.isIos && file.type() == FileType.internal){
+             try{
+diff --git a/arc-core/src/arc/graphics/Mesh.java b/arc-core/src/arc/graphics/Mesh.java
+index 08cbd35..e5c4ff3 100644
+--- a/arc-core/src/arc/graphics/Mesh.java
++++ b/arc-core/src/arc/graphics/Mesh.java
+@@ -61,7 +61,8 @@ public class Mesh implements Disposable{
+         this.vertexSize = count;
+         this.attributes = attributes;
+ 
+-        if(useVertexArray && Core.gl30 == null){
++        //WebGL has no client-side vertex arrays
++        if(useVertexArray && Core.gl30 == null && !arc.util.OS.isWeb){
+             vertices = new VertexArray(maxVertices, this);
+             indices = new IndexArray(maxIndices);
+         }else if(Core.gl30 != null){
+diff --git a/arc-core/src/arc/graphics/g2d/SpriteBatch.java b/arc-core/src/arc/graphics/g2d/SpriteBatch.java
+index c4fb449..dd52040 100644
+--- a/arc-core/src/arc/graphics/g2d/SpriteBatch.java
++++ b/arc-core/src/arc/graphics/g2d/SpriteBatch.java
+@@ -30,7 +30,7 @@ public class SpriteBatch extends Batch{
+     public static long totalDrawCalls = 0;
+ 
+     static ForkJoinHolder commonPool;
+-    boolean multithreaded = !OS.isIos && !OS.isAndroid;
++    boolean multithreaded = !OS.isIos && !OS.isAndroid && !OS.isWeb;
+ 
+     protected Mesh mesh;
+     protected FloatBuffer buffer;
+diff --git a/arc-core/src/arc/util/OS.java b/arc-core/src/arc/util/OS.java
+index cc10572..08ee096 100644
+--- a/arc-core/src/arc/util/OS.java
++++ b/arc-core/src/arc/util/OS.java
+@@ -30,6 +30,8 @@ public class OS{
+     public static boolean isLinux = propNoNull("os.name").contains("Linux") || propNoNull("os.name").contains("BSD");
+     public static boolean isMac = propNoNull("os.name").contains("Mac");
+     public static boolean isIos = false;
++    /** Compiled to JavaScript with TeaVM. */
++    public static boolean isWeb = propNoNull("os.name").equals("TeaVM");
+     public static boolean isAndroid = false;
+     public static boolean isARM = propNoNull("os.arch").startsWith("arm") || propNoNull("os.arch").startsWith("aarch64");
+     public static boolean is64Bit = propNoNull("os.arch").contains("64") || propNoNull("os.arch").startsWith("armv8");
+@@ -45,7 +47,7 @@ public class OS{
+             is64Bit = false;
+         }
+         //if it's none of the standard operating systems, it's iOS
+-        if(propNoNull("moe.platform.name").equals("iOS") || (!isAndroid && !isWindows && !isLinux && !isMac)){
++        if(propNoNull("moe.platform.name").equals("iOS") || (!isAndroid && !isWindows && !isLinux && !isMac && !isWeb)){
+             isIos = true;
+             isAndroid = false;
+             isWindows = false;

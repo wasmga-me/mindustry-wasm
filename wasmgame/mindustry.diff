@@ -1,0 +1,211 @@
+diff --git a/core/src/mindustry/ClientLauncher.java b/core/src/mindustry/ClientLauncher.java
+index 640b126..ed5c12a 100644
+--- a/core/src/mindustry/ClientLauncher.java
++++ b/core/src/mindustry/ClientLauncher.java
+@@ -219,7 +219,8 @@ public abstract class ClientLauncher extends ApplicationCore implements Platform
+ 
+         int targetfps = ios ? 0 : Core.settings.getInt("fpscap", 120);
+         boolean changed = lastTargetFps != targetfps && lastTargetFps != -1;
+-        boolean limitFps = targetfps > 0 && targetfps <= 240;
++        //the browser paces frames itself
++        boolean limitFps = targetfps > 0 && targetfps <= 240 && !OS.isWeb;
+ 
+         lastTargetFps = targetfps;
+ 
+diff --git a/core/src/mindustry/Vars.java b/core/src/mindustry/Vars.java
+index af56fac..4dad515 100644
+--- a/core/src/mindustry/Vars.java
++++ b/core/src/mindustry/Vars.java
+@@ -514,7 +514,13 @@ public class Vars implements Loadable{
+             settings.put("uiscale", 100);
+         }
+ 
+-        Scl.setProduct(Math.max(settings.getInt("uiscale", 100), 25) / 100f);
++        float uiscale = Math.max(settings.getInt("uiscale", 100), 25) / 100f;
++        if(OS.isWeb){
++            //the browser build works in physical pixels: follow the screen's pixel ratio, a little smaller in a small window
++            float density = Core.graphics.getDensity();
++            uiscale *= density * arc.math.Mathf.clamp(Math.min(Core.graphics.getWidth() / density / 1100f, Core.graphics.getHeight() / density / 700f), 0.7f, 1f);
++        }
++        Scl.setProduct(uiscale);
+ 
+         if(!loadLocales) return;
+ 
+diff --git a/core/src/mindustry/core/Control.java b/core/src/mindustry/core/Control.java
+index db6e2f5..4475a6a 100644
+--- a/core/src/mindustry/core/Control.java
++++ b/core/src/mindustry/core/Control.java
+@@ -687,7 +687,7 @@ public class Control implements ApplicationListener, Loadable{
+ 
+         sound.update();
+ 
+-        if(Core.input.keyTap(Binding.fullscreen)){
++        if(!arc.util.OS.isWeb && Core.input.keyTap(Binding.fullscreen)){
+             boolean full = settings.getBool("fullscreen");
+             graphics.setFullscreen(!full);
+             settings.put("fullscreen", !full);
+diff --git a/core/src/mindustry/ui/dialogs/PausedDialog.java b/core/src/mindustry/ui/dialogs/PausedDialog.java
+index bb04424..7b6d660 100644
+--- a/core/src/mindustry/ui/dialogs/PausedDialog.java
++++ b/core/src/mindustry/ui/dialogs/PausedDialog.java
+@@ -95,7 +95,8 @@ public class PausedDialog extends BaseDialog{
+             cont.row();
+ 
+             //the button runs out of space when the editor button is added, so use the mobile text
+-            cont.button(state.isEditor() ? "@hostserver.mobile" : "@hostserver", Icon.host, () -> {
++            //(no sockets in a browser, so no hosting there)
++            if(!arc.util.OS.isWeb) cont.button(state.isEditor() ? "@hostserver.mobile" : "@hostserver", Icon.host, () -> {
+                 if(net.server() && steam){
+                     platform.inviteFriends();
+                 }else{
+@@ -149,7 +150,7 @@ public class PausedDialog extends BaseDialog{
+                 cont.row();
+             }
+ 
+-            cont.buttonRow("@hostserver.mobile", Icon.host, ui.host::show).disabled(b -> net.active());
++            if(!arc.util.OS.isWeb) cont.buttonRow("@hostserver.mobile", Icon.host, ui.host::show).disabled(b -> net.active());
+ 
+             cont.buttonRow("@quit", Icon.exit, this::showQuitConfirm).update(s -> {
+                 s.setText(control.saves.getCurrent() != null && control.saves.getCurrent().isAutosave() ? "@save.quit" : "@quit");
+diff --git a/core/src/mindustry/ui/dialogs/SettingsMenuDialog.java b/core/src/mindustry/ui/dialogs/SettingsMenuDialog.java
+index cd1c722..7e6bcaf 100644
+--- a/core/src/mindustry/ui/dialogs/SettingsMenuDialog.java
++++ b/core/src/mindustry/ui/dialogs/SettingsMenuDialog.java
+@@ -275,7 +275,8 @@ public class SettingsMenuDialog extends BaseDialog{
+                 }
+             }))).marginLeft(4);
+ 
+-            if(!mobile){
++            //a page can't open a folder
++            if(!mobile && !arc.util.OS.isWeb){
+                 t.row();
+                 t.button("@data.openfolder", Icon.folder, style, () -> Core.app.openFolder(Core.settings.getDataDirectory().absolutePath())).marginLeft(4);
+             }
+@@ -480,13 +481,16 @@ public class SettingsMenuDialog extends BaseDialog{
+         });
+ 
+         if(!mobile){
+-            graphics.checkPref("vsync", true, b -> Core.graphics.setVSync(b));
+-            graphics.checkPref("fullscreen", false, b -> Core.graphics.setFullscreen(b));
++            //in a browser the page owns full screen and the frame rate
++            if(!arc.util.OS.isWeb){
++                graphics.checkPref("vsync", true, b -> Core.graphics.setVSync(b));
++                graphics.checkPref("fullscreen", false, b -> Core.graphics.setFullscreen(b));
+ 
+-            Core.graphics.setVSync(Core.settings.getBool("vsync"));
++                Core.graphics.setVSync(Core.settings.getBool("vsync"));
+ 
+-            if(Core.settings.getBool("fullscreen")){
+-                Core.app.post(() -> Core.graphics.setFullscreen(true));
++                if(Core.settings.getBool("fullscreen")){
++                    Core.app.post(() -> Core.graphics.setFullscreen(true));
++                }
+             }
+         }else if(!ios){
+             graphics.checkPref("landscape", false, b -> {
+diff --git a/core/src/mindustry/ui/fragments/MenuFragment.java b/core/src/mindustry/ui/fragments/MenuFragment.java
+index e95befc..1d7f472 100644
+--- a/core/src/mindustry/ui/fragments/MenuFragment.java
++++ b/core/src/mindustry/ui/fragments/MenuFragment.java
+@@ -152,10 +152,13 @@ public class MenuFragment{
+ 
+         Seq<MobileButton> customs = customButtons.map(b -> new MobileButton(b.icon, b.text, b.runnable == null ? () -> {} : b.runnable));
+ 
++        //no sockets, mod code or quitting in a browser
++        boolean web = arc.util.OS.isWeb;
++
+         if(!Core.graphics.isPortrait()){
+             container.marginTop(60f);
+             container.add(play);
+-            container.add(join);
++            if(!web) container.add(join);
+             container.add(custom);
+             container.add(maps);
+             // add odd custom buttons
+@@ -166,30 +169,30 @@ public class MenuFragment{
+ 
+             container.add(editor);
+             container.add(tools);
+-            container.add(mods);
++            if(!web) container.add(mods);
+             // add even custom buttons (before the exit button)
+             for(int i = 0; i < customs.size; i += 2){
+                 container.add(customs.get(i));
+             }
+-            container.add(ios ? about : exit);
++            container.add(ios || web ? about : exit);
+         }else{
+             container.marginTop(0f);
+             container.add(play);
+             container.add(maps);
+             container.row();
+             container.add(custom);
+-            container.add(join);
++            if(!web) container.add(join);
+             container.row();
+             container.add(editor);
+             container.add(tools);
+             container.row();
+-            container.add(mods);
++            if(!web) container.add(mods);
+             // add custom buttons
+             for(int i = 0; i < customs.size; i++){
+                 container.add(customs.get(i));
+                 if(i % 2 == 0) container.row();
+             }
+-            container.add(ios ? about : exit);
++            container.add(ios || web ? about : exit);
+         }
+     }
+ 
+@@ -210,7 +213,8 @@ public class MenuFragment{
+                 desktopButtons = Seq.with(
+                     new MenuButton("@play", Icon.play,
+                         new MenuButton("@campaign", Icon.play, () -> checkPlay(ui.planet::show)),
+-                        new MenuButton("@joingame", Icon.add, () -> checkPlay(ui.join::show)),
++                        //no sockets in a browser
++                        arc.util.OS.isWeb ? null : new MenuButton("@joingame", Icon.add, () -> checkPlay(ui.join::show)),
+                         new MenuButton("@customgame", Icon.terrain, () -> checkPlay(ui.custom::show)),
+                         new MenuButton("@loadgame", Icon.download, () -> checkPlay(ui.load::show))
+                     ),
+@@ -220,14 +224,15 @@ public class MenuFragment{
+                         new MenuButton("@about.button", Icon.info, ui.about::show)
+                     ),
+                     new MenuButton("@editor", Icon.terrain, () -> checkPlay(ui.maps::show)), steam ? new MenuButton("@workshop", Icon.steam, platform::openWorkshop) : null,
+-                    new MenuButton("@mods", Icon.book, ui.mods::show),
++                    arc.util.OS.isWeb ? null : new MenuButton("@mods", Icon.book, ui.mods::show),
+                     new MenuButton("@settings", Icon.settings, ui.settings::show)
+                 );
+             }
+ 
+             buttons(t, desktopButtons.toArray(MenuButton.class));
+             buttons(t, customButtons.toArray(MenuButton.class));
+-            buttons(t, new MenuButton("@quit", Icon.exit, Core.app::exit));
++            //a page can't close itself
++            if(!arc.util.OS.isWeb) buttons(t, new MenuButton("@quit", Icon.exit, Core.app::exit));
+         }).width(width).growY();
+ 
+         container.table(background, t -> {
+diff --git a/core/src/mindustry/world/Block.java b/core/src/mindustry/world/Block.java
+index 3de4240..f03550c 100644
+--- a/core/src/mindustry/world/Block.java
++++ b/core/src/mindustry/world/Block.java
+@@ -404,6 +404,8 @@ public class Block extends UnlockableContent implements Senseable{
+     /** Building that is created for this block. Initialized in init() via reflection. Set manually if modded. */
+     @NoPatch
+     public Prov<Building> buildType = null;
++    /** Set by the browser build: finds the building type without reflection. */
++    public static @Nullable Func<Block, Prov<Building>> webBuildTypes;
+     /** Configuration handlers by type. */
+     @NoPatch
+     public ObjectMap<Class<?>, Cons2> configurations = new ObjectMap<>();
+@@ -1252,6 +1254,9 @@ public class Block extends UnlockableContent implements Senseable{
+ 
+             subclass = current;
+ 
++            //the browser build can't list declared classes; it sets a lookup generated at build time
++            if(webBuildTypes != null) buildType = webBuildTypes.get(this);
++
+             while(buildType == null && Block.class.isAssignableFrom(current)){
+                 //first class that is subclass of Building
+                 Class<?> type = Structs.find(current.getDeclaredClasses(), t -> Building.class.isAssignableFrom(t) && !t.isInterface());

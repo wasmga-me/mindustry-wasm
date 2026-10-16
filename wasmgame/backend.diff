@@ -1,0 +1,5047 @@
+diff --git a/port/host/mindustry-host.js b/port/host/mindustry-host.js
+new file mode 100644
+index 0000000..dbc25f9
+--- /dev/null
++++ b/port/host/mindustry-host.js
+@@ -0,0 +1,272 @@
++// Page side of the Mindustry browser build: loads the natives, the asset packs and the
++// player's files, records input for WebInput.java, and keeps the files the game writes for the page.
++(function(){
++    "use strict";
++
++    /** Reads a pak's header: the files it lists and where their bytes start. */
++    function readHeader(buf, length){
++        if(length < 4) return null;
++        const headLen = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
++        if(length < 4 + headLen) return null;
++        return {list: JSON.parse(new TextDecoder().decode(buf.subarray(4, 4 + headLen))), start: 4 + headLen};
++    }
++
++    /** The files in a whole pak; lazy ones are listed with no bytes (the music pak has them). */
++    function readPack(buf){
++        const {list, start} = readHeader(buf, buf.length);
++        const files = [];
++        let off = start;
++        for(const [path, size, lazy] of list){
++            if(lazy){
++                files.push({path, data: new Int8Array(0)});
++                continue;
++            }
++            files.push({path, data: new Int8Array(buf.buffer, buf.byteOffset + off, size)});
++            off += size;
++        }
++        return files;
++    }
++
++    /**
++     * Downloads a pak and hands over each file as soon as its bytes are in.
++     * Calls done(false) when the download fails part way.
++     */
++    async function streamPack(url, onFile, done){
++        try{
++            const res = await fetch(url);
++            if(!res.ok) throw new Error(url + ": " + res.status);
++            const reader = res.body.getReader();
++            let buf = new Uint8Array(1 << 16), length = 0, header = null, next = 0, off = 0;
++            for(;;){
++                const {done: end, value} = await reader.read();
++                if(end) break;
++                if(length + value.length > buf.length){
++                    const grown = new Uint8Array(Math.max(buf.length * 2, length + value.length));
++                    grown.set(buf.subarray(0, length));
++                    buf = grown;
++                }
++                buf.set(value, length);
++                length += value.length;
++                if(!header && (header = readHeader(buf, length))) off = header.start;
++                while(header && next < header.list.length && off + header.list[next][1] <= length){
++                    const [path, size] = header.list[next++];
++                    onFile(path, new Int8Array(buf.slice(off, off + size).buffer));
++                    off += size;
++                }
++            }
++            done(!!header && next === header.list.length);
++        }catch(e){
++            done(false);
++        }
++    }
++
++    function loadScript(src){
++        return new Promise((resolve, reject) => {
++            const s = document.createElement("script");
++            s.src = src;
++            s.onload = resolve;
++            s.onerror = () => reject(new Error("Could not load " + src));
++            document.head.appendChild(s);
++        });
++    }
++
++    // keys the browser keeps: reload, full screen (the page's), developer tools
++    const keep = new Set(["F5", "F11", "F12"]);
++    const modifiers = new Set(["ControlLeft", "ControlRight", "MetaLeft", "MetaRight"]);
++    // with Ctrl or Meta held, only the game's own shortcuts; the rest stay the browser's
++    const shortcuts = new Set(["KeyA", "KeyC", "KeyX", "KeyZ", "KeyY"]);
++
++    function recordInput(host, canvas){
++        const ev = host.events;
++        const pos = (e) => {
++            const r = canvas.getBoundingClientRect();
++            return {x: e.clientX - r.left, y: e.clientY - r.top};
++        };
++        canvas.tabIndex = 0;
++
++        canvas.addEventListener("keydown", (e) => {
++            if(keep.has(e.code) || ((e.ctrlKey || e.metaKey) && !modifiers.has(e.code) && !shortcuts.has(e.code))) return;
++            e.preventDefault();
++            ev.push({t: "kd", code: e.code, repeat: e.repeat});
++            if(e.key.length === 1 && !e.ctrlKey && !e.metaKey) ev.push({t: "ch", key: e.key});
++        });
++        canvas.addEventListener("keyup", (e) => {
++            ev.push({t: "ku", code: e.code});
++        });
++        canvas.addEventListener("paste", (e) => {
++            const text = e.clipboardData && e.clipboardData.getData("text");
++            if(text) ev.push({t: "ch", key: text});
++            e.preventDefault();
++        });
++
++        canvas.addEventListener("pointerdown", (e) => {
++            canvas.focus({preventScroll: true});
++            canvas.setPointerCapture(e.pointerId);
++            const p = pos(e);
++            if(e.pointerType === "mouse") ev.push({t: "md", x: p.x, y: p.y, b: e.button});
++            else ev.push({t: "td", x: p.x, y: p.y, id: e.pointerId});
++            e.preventDefault();
++        });
++        const up = (e) => {
++            const p = pos(e);
++            if(e.pointerType === "mouse") ev.push({t: "mu", x: p.x, y: p.y, b: e.button});
++            else ev.push({t: "tu", x: p.x, y: p.y, id: e.pointerId});
++        };
++        canvas.addEventListener("pointerup", up);
++        canvas.addEventListener("pointercancel", up);
++        canvas.addEventListener("pointermove", (e) => {
++            const p = pos(e);
++            if(e.pointerType === "mouse") ev.push({t: "mm", x: p.x, y: p.y});
++            else ev.push({t: "tm", x: p.x, y: p.y, id: e.pointerId});
++        });
++        canvas.addEventListener("wheel", (e) => {
++            e.preventDefault();
++            ev.push({t: "wh", x: Math.sign(e.deltaX), y: Math.sign(e.deltaY)});
++        }, {passive: false});
++        canvas.addEventListener("contextmenu", (e) => e.preventDefault());
++        canvas.addEventListener("blur", () => ev.push({t: "blur"}));
++        canvas.style.touchAction = "none";
++
++        // on touch screens, text fields need a real input to bring up the keyboard
++        const text = document.createElement("input");
++        text.type = "text";
++        text.autocomplete = "off";
++        text.setAttribute("autocapitalize", "off");
++        text.setAttribute("aria-hidden", "true");
++        text.tabIndex = -1;
++        text.style.cssText = "position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;pointer-events:none";
++        document.body.appendChild(text);
++        text.addEventListener("beforeinput", (e) => {
++            if(e.inputType === "deleteContentBackward"){
++                ev.push({t: "kd", code: "Backspace"}, {t: "ku", code: "Backspace"});
++            }else if(e.inputType === "insertLineBreak"){
++                ev.push({t: "kd", code: "Enter"}, {t: "ku", code: "Enter"});
++            }else if(e.data){
++                ev.push({t: "ch", key: e.data});
++            }
++            e.preventDefault();
++        });
++        let touched = false;
++        canvas.addEventListener("pointerdown", (e) => { touched = e.pointerType !== "mouse"; });
++        host.textInput = (on) => {
++            if(on && touched) text.focus({preventScroll: true});
++            else if(!on && document.activeElement === text) canvas.focus({preventScroll: true});
++        };
++    }
++
++    window.startMindustry = async function(opts){
++        const canvas = opts.canvas;
++        const base = opts.base;
++        // the player's files, kept by the page: path -> {data, modified}
++        const files = new Map();
++        for(const f of opts.saved || []) files.set(f.path, {data: f.data, modified: f.modified || Date.now()});
++        const saved = [...files].map(([path, f]) => ({path, data: new Int8Array(f.data.buffer, f.data.byteOffset, f.data.length), modified: f.modified}));
++
++        const [natives] = await Promise.all([
++            loadScript(base + "arc-natives.js").then(() => window.createArcNatives({locateFile: (f) => base + f})),
++            loadScript(base + "mindustry.js")
++        ]);
++        const packs = opts.packs.map(readPack);
++        window.arcNatives = natives;
++        // SoLoud starts with the game (its init sets the volume), so this is applied again once it runs
++        let muted = !!opts.muted;
++
++        let version = 0;
++        // music: what came in so far, who waits for what, and whether the download is over
++        const music = new Map(), waiting = new Map();
++        let musicDone = false;
++
++        const host = window.mindustryHost = {
++            canvas,
++            events: [],
++            assets: [].concat(...packs),
++            saved,
++            files,
++            /** Goes up each time a file changes. */
++            version: () => version,
++            store(path, data, modified){
++                files.set(path, {data: new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.length)), modified});
++                version++;
++            },
++            remove(path){
++                if(files.delete(path)) version++;
++            },
++            setMuted(m){
++                muted = m;
++                natives._arc_set_muted(m ? 1 : 0);
++            },
++            onVisibility: null,
++            writeClipboard(text){
++                if(navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
++            },
++            download(name, data){
++                const a = document.createElement("a");
++                a.href = URL.createObjectURL(new Blob([data]));
++                a.download = name;
++                a.click();
++                setTimeout(() => URL.revokeObjectURL(a.href), 10000);
++            },
++            pickFile(accept, done){
++                const input = document.createElement("input");
++                input.type = "file";
++                input.accept = accept;
++                input.addEventListener("change", async () => {
++                    const f = input.files[0];
++                    if(f) done(f.name, new Int8Array(await f.arrayBuffer()));
++                });
++                input.click();
++            },
++            openURI(uri){
++                window.open(uri, "_blank", "noopener");
++            },
++            cursorUrl(pixels, w, h){
++                const c = document.createElement("canvas");
++                c.width = w;
++                c.height = h;
++                c.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
++                return c.toDataURL();
++            },
++            textInput(){},
++            crash(message){
++                if(opts.onCrash) opts.onCrash(message);
++                else console.error(message);
++            },
++            log(message){
++                if(opts.onLog) opts.onLog(message);
++            },
++            exit(){
++                if(opts.onExit) opts.onExit();
++            },
++            ready(){
++                natives._arc_set_muted(muted ? 1 : 0);
++                // after the start, so it doesn't hold up anything the game waits for;
++                // a download that fails is tried again a little later, twice
++                const fetchMusic = (attempt) => streamPack(opts.music, (path, data) => {
++                    if(music.has(path)) return;
++                    music.set(path, data);
++                    for(const id of waiting.get(path) || []) host.lazyLoaded.push({id, data});
++                    waiting.delete(path);
++                }, (ok) => {
++                    if(!ok && attempt < 3) return setTimeout(() => fetchMusic(attempt + 1), attempt * 5000);
++                    musicDone = true;
++                    for(const ids of waiting.values()) for(const id of ids) host.lazyLoaded.push({id, data: null});
++                    waiting.clear();
++                });
++                if(opts.music) fetchMusic(1);
++                else musicDone = true;
++                if(opts.onReady) opts.onReady();
++            },
++            lazyLoaded: [],
++            fetchLazy(id, path){
++                if(music.has(path) || musicDone) host.lazyLoaded.push({id, data: music.get(path) || null});
++                else waiting.set(path, (waiting.get(path) || []).concat(id));
++            }
++        };
++        recordInput(host, canvas);
++        document.addEventListener("visibilitychange", () => {
++            if(host.onVisibility) host.onVisibility(!document.hidden);
++        });
++        window.main([]);
++        return host;
++    };
++})();
+diff --git a/port/host/pack.py b/port/host/pack.py
+new file mode 100644
+index 0000000..b7cbca2
+--- /dev/null
++++ b/port/host/pack.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""Packs Mindustry's assets for the page.
++
++Writes two paks: <out>/mindustry-core.pak (everything the game reads at start) and
++<out>/mindustry-music.pak (the music, fetched after the game starts and read as it arrives,
++menu music first). Pak format: uint32 LE header length, a JSON header [[path, size, lazy], ...],
++then the files back to back. The core pak lists the music as lazy (size 0 there), so the game
++sees those files and asks the page for them.
++Usage: pack.py <out dir> <dir>... (core/assets, then classpath resources)
++"""
++import json
++import os
++import struct
++import sys
++
++# sprites/fallback is the atlas for GPUs without 4096px textures; WebGL 2 guarantees 4096
++SKIP = ('sprites/fallback/', 'scripts/')
++LAZY = 'music/'
++FIRST = ['menu', 'land', 'launch', 'game1', 'game2', 'game3']
++
++
++def write(path, header, files):
++    head = json.dumps(header, separators=(',', ':')).encode()
++    with open(path, 'wb') as f:
++        f.write(struct.pack('<I', len(head)))
++        f.write(head)
++        for p, size, lazy in header:
++            if not lazy:
++                with open(files[p], 'rb') as src:
++                    data = src.read()
++                assert len(data) == size
++                f.write(data)
++    print(path, len(header), 'files', os.path.getsize(path) // 1024, 'KB')
++
++
++def main():
++    out = sys.argv[1]
++    files = {}
++    for root in sys.argv[2:]:
++        for d, _, names in os.walk(root):
++            for n in names:
++                files.setdefault(os.path.relpath(os.path.join(d, n), root).replace(os.sep, '/'), os.path.join(d, n))
++    paths = sorted(f for f in files if not f.startswith(SKIP))
++    music = [p for p in paths if p.startswith(LAZY)]
++    name = lambda p: os.path.splitext(os.path.basename(p))[0]
++    music.sort(key=lambda p: (FIRST.index(name(p)) if name(p) in FIRST else len(FIRST), p))
++    write(os.path.join(out, 'mindustry-core.pak'),
++          [[p, os.path.getsize(files[p]), 1 if p.startswith(LAZY) else 0] for p in paths], files)
++    write(os.path.join(out, 'mindustry-music.pak'), [[p, os.path.getsize(files[p]), 0] for p in music], files)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/port/natives/build-natives.sh b/port/natives/build-natives.sh
+new file mode 100755
+index 0000000..bd91f48
+--- /dev/null
++++ b/port/natives/build-natives.sh
+@@ -0,0 +1,41 @@
++#!/bin/bash
++# Builds arc-natives.js/.wasm: FreeType and SoLoud with Arc's JNI bodies (see jni2wasm.py).
++# Needs emsdk 4.0.7 activated, SOLOUD and FREETYPE pointing at the source checkouts,
++# and soloud_jni.cpp/freetype_jni.cpp generated next to this script.
++set -euo pipefail
++here=$(cd "$(dirname "$0")" && pwd)
++out=${OUT:-$here/out}
++obj=$out/obj
++mkdir -p "$obj"
++
++ft=$FREETYPE
++sl=$SOLOUD
++ftflags="-O2 -DFT2_BUILD_LIBRARY -DFT_CONFIG_MODULES_H=<ftmodule_arc.h> -I$here -I$ft/include"
++slflags="-O2 -DWITH_MINIAUDIO -DSOLOUD_MAX_VOICE_COUNT=100 -I$sl/include -I$sl/src/audiosource/wav -I$sl/src/backend/miniaudio"
++
++objs=()
++compile(){ # compiler flags src
++    local o="$obj/$(echo "$3" | md5sum | cut -c1-12)-$(basename "$3").o"
++    if [ ! -f "$o" ] || [ "$3" -nt "$o" ]; then $1 $2 -c "$3" -o "$o"; fi
++    objs+=("$o")
++}
++
++for f in base/ftsystem.c base/ftinit.c base/ftdebug.c base/ftbase.c base/ftbbox.c base/ftglyph.c base/ftbitmap.c \
++         base/ftstroke.c base/ftmm.c truetype/truetype.c sfnt/sfnt.c smooth/smooth.c autofit/autofit.c gzip/ftgzip.c psnames/psnames.c; do
++    compile emcc "$ftflags" "$ft/src/$f"
++done
++for f in "$sl"/src/core/*.cpp "$sl"/src/audiosource/wav/*.cpp "$sl"/src/filter/*.cpp "$sl"/src/backend/miniaudio/*.cpp; do
++    compile em++ "$slflags" "$f"
++done
++compile emcc "$slflags" "$sl/src/audiosource/wav/stb_vorbis.c"
++compile em++ "-O2 -I$here" "$here/jni_shim.cpp"
++compile em++ "$ftflags -I$here" "$here/freetype_jni.cpp"
++compile em++ "$slflags -I$here" "$here/soloud_jni.cpp"
++compile em++ "$slflags" "$here/web_audio.cpp"
++
++em++ -O2 "${objs[@]}" -o "$out/arc-natives.js" \
++    -sMODULARIZE -sEXPORT_NAME=createArcNatives -sENVIRONMENT=web \
++    -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=64MB -sSTACK_SIZE=1MB \
++    -sEXPORTED_FUNCTIONS=_malloc,_free \
++    -sEXPORTED_RUNTIME_METHODS=HEAP8,HEAPU8,HEAP16,HEAPU16,HEAP32,HEAPF32,HEAPF64,stringToNewUTF8,UTF8ToString
++ls -l "$out"/arc-natives.*
+diff --git a/port/natives/ftmodule_arc.h b/port/natives/ftmodule_arc.h
+new file mode 100644
+index 0000000..d8287bb
+--- /dev/null
++++ b/port/natives/ftmodule_arc.h
+@@ -0,0 +1,6 @@
++/* the FreeType modules Arc builds with */
++FT_USE_MODULE( FT_Module_Class, autofit_module_class )
++FT_USE_MODULE( FT_Driver_ClassRec, tt_driver_class )
++FT_USE_MODULE( FT_Module_Class, psnames_module_class )
++FT_USE_MODULE( FT_Module_Class, sfnt_module_class )
++FT_USE_MODULE( FT_Renderer_Class, ft_smooth_renderer_class )
+diff --git a/port/natives/jni2wasm.py b/port/natives/jni2wasm.py
+new file mode 100644
+index 0000000..b2b69f2
+--- /dev/null
++++ b/port/natives/jni2wasm.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python3
++"""Turns the jnigen-style natives of an Arc class into a wasm build.
++
++For a Java file whose native methods carry their C/C++ body in a comment (jnigen style),
++writes:
++  - <out>.cpp: one exported C function per native, compiled with emscripten;
++  - a Java copy of the class (package moved to --package) where each native calls the
++    function through window.arcNatives, the emscripten module the page loads first.
++
++Pointers (Java long) are 32-bit in wasm. Arrays, strings and buffers are copied into the
++wasm heap for the call; buffers named in --keep stay there (FreeType keeps font data).
++"""
++import argparse
++import re
++
++NATIVE = re.compile(
++    r'^([ \t]*)((?:(?:public|private|protected|static|native|final)\s+)+)([\w\[\].]+)\s+(\w+)\s*\(([^)]*)\)\s*;[ \t]*/\*(MANUAL)?(.*?)\*/',
++    re.S | re.M)
++JNI_BLOCK = re.compile(r'/\*JNI(.*?)\*/', re.S)
++
++C_TYPES = {
++    'void': 'void', 'int': 'jint', 'long': 'jlong', 'float': 'jfloat', 'double': 'jdouble',
++    'boolean': 'jboolean', 'short': 'jshort', 'byte': 'jbyte', 'char': 'jchar',
++    'String': 'char*', 'byte[]': 'char*', 'boolean[]': 'char*', 'short[]': 'short*',
++    'char[]': 'unsigned short*', 'int[]': 'int*', 'float[]': 'float*', 'double[]': 'double*',
++    'Buffer': 'unsigned char*', 'ByteBuffer': 'unsigned char*', 'FloatBuffer': 'unsigned char*',
++    'ShortBuffer': 'unsigned char*', 'IntBuffer': 'unsigned char*',
++}
++RETURN_C = {'String': 'jstring', 'ByteBuffer': 'jobject'}
++ARRAY_JS = {'byte[]': 'HEAP8', 'boolean[]': 'HEAP8', 'short[]': 'HEAP16', 'char[]': 'HEAPU16',
++            'int[]': 'HEAP32', 'float[]': 'HEAPF32', 'double[]': 'HEAPF64'}
++ELEM = {'HEAP8': 1, 'HEAP16': 2, 'HEAPU16': 2, 'HEAP32': 4, 'HEAPF32': 4, 'HEAPF64': 8}
++
++
++def class_stack_at(text, pos):
++    """Names of the classes enclosing pos, outermost first (skips comments and strings)."""
++    stack = []
++    pending = None
++    i = 0
++    depth = 0
++    while i < pos:
++        c = text[i]
++        if text.startswith('/*', i):
++            i = text.find('*/', i + 2) + 2
++            continue
++        if text.startswith('//', i):
++            i = text.find('\n', i)
++            continue
++        if c == '"' or c == "'":
++            j = i + 1
++            while text[j] != c:
++                j += 2 if text[j] == '\\' else 1
++            i = j + 1
++            continue
++        m = re.match(r'(?:class|interface|enum)\s+(\w+)', text[i:i + 200])
++        if m and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == '_')):
++            pending = m.group(1)
++            i += m.end()
++            continue
++        if c == '{':
++            depth += 1
++            stack.append((pending, depth))
++            pending = None
++        elif c == '}':
++            stack.pop()
++            depth -= 1
++        i += 1
++    return [name for name, _ in stack if name]
++
++
++def parse_params(params):
++    out = []
++    for p in params.split(','):
++        p = p.strip()
++        if not p:
++            continue
++        t, n = p.rsplit(None, 1)
++        out.append((t.replace('final ', '').strip(), n))
++    return out
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('java')
++    ap.add_argument('--package', required=True)
++    ap.add_argument('--java-out', required=True)
++    ap.add_argument('--cpp-out', required=True)
++    ap.add_argument('--keep', default='', help='comma-separated Class.method.param buffers left in the heap')
++    ap.add_argument('--override', action='append', default=[],
++                    help='Class.method=java body used instead of a native call')
++    ap.add_argument('--skip', default='', help='comma-separated Class.method natives left as throwing stubs')
++    args = ap.parse_args()
++
++    keep = set(filter(None, args.keep.split(',')))
++    skip = set(filter(None, args.skip.split(',')))
++    overrides = dict(o.split('=', 1) for o in args.override)
++    src = open(args.java).read()
++    orig_pkg = re.search(r'^package\s+([\w.]+);', src, re.M).group(1)
++
++    header = '\n'.join(JNI_BLOCK.findall(src))
++    cpp = ['// generated by jni2wasm.py from ' + args.java.split('/')[-1], '#include "jni_shim.h"', header, 'extern "C" {']
++
++    out = []
++    last = 0
++    names = {}
++    for m in NATIVE.finditer(src):
++        indent, mods, ret, name, params, manual, body = m.groups()
++        if 'native' not in mods.split():
++            continue
++        cls = '_'.join(class_stack_at(src, m.start()))
++        key = cls.split('_')[-1] + '.' + name
++        params = parse_params(params)
++        cname = cls + '_' + name
++        names[cname] = names.get(cname, 0) + 1
++        if names[cname] > 1:
++            cname += str(names[cname])
++        jmods = ' '.join(x for x in mods.split() if x != 'native')
++        out.append(src[last:m.start()])
++        last = m.end()
++
++        sig = ', '.join(t + ' ' + n for t, n in params)
++        if key in overrides:
++            out.append(f'{indent}{jmods} {ret} {name}({sig}){{\n{indent}    {overrides[key]}\n{indent}}}')
++            continue
++        if manual or key in skip:
++            out.append(f'{indent}{jmods} {ret} {name}({sig}){{\n{indent}    throw new UnsupportedOperationException("{key}");\n{indent}}}')
++            continue
++
++        # C side
++        cparams = []
++        locals_ = []
++        for t, n in params:
++            cparams.append(f'{C_TYPES[t]} {n}')
++            if ('obj_' + n) in body:
++                locals_.append(f'jobject obj_{n} = 0;')
++        cret = RETURN_C.get(ret, C_TYPES.get(ret))
++        cpp.append(f'EMSCRIPTEN_KEEPALIVE {cret} {cname}({", ".join(cparams)}){{')
++        cpp.append('    JNIEnv* env = &jni_env; (void)env;')
++        cpp += ['    ' + l for l in locals_]
++        cpp.append(body.rstrip())
++        cpp.append('}')
++
++        # JS bridge
++        jsparams, jsargs, prep, post, callargs = [], [], [], [], []
++        for t, n in params:
++            if t == 'long':
++                jsparams.append(f'int {n}')
++                jsargs.append(f'(int){n}')
++                callargs.append(n)
++            elif t == 'String':
++                jsparams.append(f'String {n}')
++                jsargs.append(n)
++                prep.append(f'var p_{n} = {n} == null ? 0 : M.stringToNewUTF8({n});')
++                post.append(f'M._free(p_{n});')
++                callargs.append(f'p_{n}')
++            elif t in ARRAY_JS:
++                heap = ARRAY_JS[t]
++                jsparams.append(f'@JSByRef {t} {n}')
++                jsargs.append(n)
++                size = f'{n}.length * {ELEM[heap]}'
++                prep.append(f'var p_{n} = M._malloc({size} || 1); M.{heap}.set({n}, p_{n} / {ELEM[heap]});')
++                post.append(f'{n}.set(M.{heap}.subarray(p_{n} / {ELEM[heap]}, p_{n} / {ELEM[heap]} + {n}.length)); M._free(p_{n});')
++                callargs.append(f'p_{n}')
++            elif t.endswith('Buffer'):
++                jsparams.append(f'@JSBuffer(JSBufferType.UINT8) java.nio.Buffer {n}')
++                jsargs.append(n)
++                prep.append(f'var p_{n} = M._malloc({n}.length || 1); M.HEAPU8.set({n}, p_{n});')
++                if f'{key}.{n}' not in keep:
++                    post.append(f'{n}.set(M.HEAPU8.subarray(p_{n}, p_{n} + {n}.length)); M._free(p_{n});')
++                callargs.append(f'p_{n}')
++            else:
++                jsparams.append(f'{t} {n}')
++                jsargs.append(n)
++                callargs.append(n)
++
++        jsret = {'long': 'int', 'ByteBuffer': 'org.teavm.jso.typedarrays.Int8Array'}.get(ret, ret)
++        conv = {
++            'void': '', 'boolean': 'return !!r;', 'String': 'return r ? M.UTF8ToString(r) : null;',
++            'ByteBuffer': 'return r ? M.HEAP8.slice(r, r + M._jni_buffer_size()) : null;',
++        }.get(ret, 'return r;')
++        script = 'var M = window.arcNatives; ' + ' '.join(prep) + f' var r = M._{cname}({", ".join(callargs)}); ' + ' '.join(post) + ' ' + conv
++        script = script.replace('\\', '\\\\').replace('"', '\\"')
++        bridge = f'{name}$wasm'
++        throws = 'ThrowNew' in body or 'throwError' in body
++
++        call = f'{bridge}({", ".join(jsargs)})'
++        lines = []
++        if ret == 'void':
++            lines.append(f'{call};')
++        elif ret == 'long':
++            lines.append(f'long result = {call};')
++        elif ret == 'ByteBuffer':
++            lines.append(f'org.teavm.jso.typedarrays.Int8Array data = {call};')
++            lines.append('java.nio.ByteBuffer result = data == null ? null : java.nio.ByteBuffer.wrap(data.toJavaArray()).order(java.nio.ByteOrder.nativeOrder());')
++        else:
++            lines.append(f'{ret} result = {call};')
++        if throws:
++            lines.append('String error = jni$error(); if(error != null) throw new arc.util.ArcRuntimeException(error);')
++        if ret != 'void':
++            lines.append('return result;')
++        body_java = ''.join(f'\n{indent}    {l}' for l in lines)
++        out.append(f'{indent}{jmods} {ret} {name}({sig}){{{body_java}\n{indent}}}\n\n'
++                   f'{indent}@org.teavm.jso.JSBody(params = {{{", ".join(chr(34) + n + chr(34) for t, n in params)}}}, script = "{script}")\n'
++                   f'{indent}private static native {jsret} {bridge}({", ".join(jsparams)});')
++
++    out.append(src[last:])
++    java = ''.join(out)
++    helper = ('\n    @org.teavm.jso.JSBody(script = "var M = window.arcNatives; var e = M._jni_take_error(); return e ? M.UTF8ToString(e) : null;")\n'
++              '    static native String jni$error();\n')
++    # insert the helper right after the top-level class opening brace
++    top = re.search(r'^public (?:final )?class \w+[^{]*\{', java, re.M)
++    java = java[:top.end()] + helper + java[top.end():]
++    java = re.sub(r'^package\s+[\w.]+;', f'package {args.package};\n\nimport {orig_pkg}.*;\nimport org.teavm.jso.*;', java, count=1, flags=re.M)
++    open(args.java_out, 'w').write(java)
++
++    cpp.append('}')
++    open(args.cpp_out, 'w').write('\n'.join(cpp) + '\n')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/port/natives/jni_shim.cpp b/port/natives/jni_shim.cpp
+new file mode 100644
+index 0000000..4175c5a
+--- /dev/null
++++ b/port/natives/jni_shim.cpp
+@@ -0,0 +1,20 @@
++#include "jni_shim.h"
++
++const char* jni_error = 0;
++int jni_buffer_length = 0;
++JNIEnv jni_env;
++
++extern "C" {
++// the message stays allocated until the next error; errors are rare
++EMSCRIPTEN_KEEPALIVE const char* jni_take_error(){
++    static const char* last = 0;
++    if(last) free((void*)last);
++    last = jni_error;
++    jni_error = 0;
++    return last;
++}
++
++EMSCRIPTEN_KEEPALIVE int jni_buffer_size(){
++    return jni_buffer_length;
++}
++}
+diff --git a/port/natives/jni_shim.h b/port/natives/jni_shim.h
+new file mode 100644
+index 0000000..92f6070
+--- /dev/null
++++ b/port/natives/jni_shim.h
+@@ -0,0 +1,36 @@
++// Just enough of JNI for the bodies of Arc's natives, compiled for the browser.
++#pragma once
++#include <emscripten.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef int32_t jint;
++typedef intptr_t jlong; // pointers are 32-bit in wasm
++typedef int jboolean;
++typedef float jfloat;
++typedef double jdouble;
++typedef int16_t jshort;
++typedef int8_t jbyte;
++typedef uint16_t jchar;
++typedef void* jobject;
++typedef void* jclass;
++typedef const char* jstring;
++
++extern const char* jni_error;
++extern int jni_buffer_length;
++
++struct JNIEnv{
++    jclass FindClass(const char*){ return (jclass)1; }
++    jint ThrowNew(jclass, const char* message){
++        if(!jni_error) jni_error = strdup(message ? message : "native error");
++        return 0;
++    }
++    jstring NewStringUTF(const char* text){ return text; }
++    jobject NewDirectByteBuffer(void* data, jlong length){
++        jni_buffer_length = (int)length;
++        return data;
++    }
++};
++
++extern JNIEnv jni_env;
+diff --git a/port/natives/web_audio.cpp b/port/natives/web_audio.cpp
+new file mode 100644
+index 0000000..cf50f29
+--- /dev/null
++++ b/port/natives/web_audio.cpp
+@@ -0,0 +1,9 @@
++// The page's mute button: SoLoud's global volume (soloud is the instance soloud_jni.cpp makes).
++#include <emscripten.h>
++#include "soloud.h"
++
++extern SoLoud::Soloud soloud;
++
++extern "C" EMSCRIPTEN_KEEPALIVE void arc_set_muted(int muted){
++    soloud.setGlobalVolume(muted ? 0.0f : 1.0f);
++}
+diff --git a/port/tools/GenBuildTypes.java b/port/tools/GenBuildTypes.java
+new file mode 100644
+index 0000000..d96d152
+--- /dev/null
++++ b/port/tools/GenBuildTypes.java
+@@ -0,0 +1,73 @@
++import java.io.*;
++import java.lang.reflect.*;
++import java.net.*;
++import java.nio.file.*;
++import java.util.*;
++import java.util.jar.*;
++
++/**
++ * Writes WebBuildTypes.java: for every block class that declares a building class, a factory that
++ * creates it. Block.initBuilding finds these by reflection (getDeclaredClasses), which the browser
++ * build doesn't have. Usage: java GenBuildTypes.java <out.java> <core jar> <classpath jars...>
++ */
++public class GenBuildTypes{
++    public static void main(String[] args) throws Exception{
++        List<URL> urls = new ArrayList<>();
++        for(int i = 1; i < args.length; i++) urls.add(new File(args[i]).toURI().toURL());
++        ClassLoader loader = new URLClassLoader(urls.toArray(new URL[0]), null);
++        Class<?> block = Class.forName("mindustry.world.Block", false, loader);
++        Class<?> building = Class.forName("mindustry.gen.Building", false, loader);
++
++        TreeMap<String, String> entries = new TreeMap<>();
++        try(JarFile jar = new JarFile(args[1])){
++            for(JarEntry e : Collections.list(jar.entries())){
++                String n = e.getName();
++                if(!n.endsWith(".class") || !n.startsWith("mindustry/")) continue;
++                Class<?> c;
++                try{
++                    c = Class.forName(n.substring(0, n.length() - 6).replace('/', '.'), false, loader);
++                }catch(Throwable t){
++                    continue;
++                }
++                if(!block.isAssignableFrom(c) || c.isAnonymousClass() || !Modifier.isPublic(c.getModifiers())) continue;
++                Class<?> type = null;
++                for(Class<?> inner : c.getDeclaredClasses()){
++                    if(building.isAssignableFrom(inner) && !inner.isInterface()){
++                        type = inner;
++                        break;
++                    }
++                }
++                if(type == null) continue;
++                String blockName = c.getName().replace('$', '.');
++                if(Modifier.isAbstract(type.getModifiers()) || !Modifier.isPublic(type.getModifiers()) || Modifier.isStatic(type.getModifiers())){
++                    //same outcome as the reflective lookup: no usable constructor
++                    entries.put(c.getName(), "        map.put(" + blockName + ".class, null);");
++                    continue;
++                }
++                entries.put(c.getName(), "        map.put(" + blockName + ".class, b -> ((" + blockName + ")b).new " + type.getSimpleName() + "());");
++            }
++        }
++
++        StringBuilder out = new StringBuilder();
++        out.append("package mindustry.web;\n\n")
++            .append("import arc.func.*;\nimport mindustry.gen.*;\nimport mindustry.world.*;\n\nimport java.util.*;\n\n")
++            .append("/** Generated by GenBuildTypes.java: the building class each block declares. */\n")
++            .append("public class WebBuildTypes{\n")
++            .append("    static final HashMap<Class<?>, Func<Block, Building>> map = new HashMap<>();\n\n")
++            .append("    /** @return a factory for the first building class declared by the block's class or its superclasses. */\n")
++            .append("    public static Prov<Building> get(Block block){\n")
++            .append("        for(Class<?> c = block.getClass(); c != null && Block.class.isAssignableFrom(c); c = c.getSuperclass()){\n")
++            .append("            if(map.containsKey(c)){\n")
++            .append("                Func<Block, Building> f = map.get(c);\n")
++            .append("                return f == null ? null : () -> f.get(block);\n")
++            .append("            }\n")
++            .append("        }\n")
++            .append("        return null;\n")
++            .append("    }\n\n")
++            .append("    static{\n");
++        for(String line : entries.values()) out.append(line).append('\n');
++        out.append("    }\n}\n");
++        Files.writeString(Path.of(args[0]), out.toString());
++        System.out.println(entries.size() + " block classes");
++    }
++}
+diff --git a/port/web/build.gradle b/port/web/build.gradle
+new file mode 100644
+index 0000000..c0adf76
+--- /dev/null
++++ b/port/web/build.gradle
+@@ -0,0 +1,46 @@
++plugins{
++    id 'java'
++    id 'org.teavm' version '0.16.0'
++}
++
++repositories{
++    mavenCentral()
++}
++
++// SRC points at the folder holding the patched Mindustry, Arc and rhino checkouts (see ../build.sh)
++def src = file(System.getenv("SRC") ?: "../src")
++
++dependencies{
++    implementation fileTree("$src/Mindustry/core/build/libs"){ include 'core-release.jar' }
++    implementation files(
++        "$src/Arc/arc-core/build/libs/arc-core-1.0.jar",
++        "$src/Arc/extensions/freetype/build/libs/freetype-1.0.jar",
++        "$src/Arc/extensions/flabel/build/libs/flabel-1.0.jar",
++        "$src/Arc/extensions/g3d/build/libs/g3d-1.0.jar",
++        "$src/Arc/extensions/fx/build/libs/fx-1.0.jar",
++        "$src/Arc/extensions/arcnet/build/libs/arcnet-1.0.jar",
++        "$src/rhino/build/libs/rhino-1.7.13-SNAPSHOT.jar"
++    )
++    implementation 'at.yawk.lz4:lz4-java:1.10.2'
++    implementation teavm.libs.jsoApis
++    compileOnly teavm.libs.interop
++    compileOnly "org.teavm:teavm-core:0.16.0"
++    compileOnly "org.teavm:teavm-classlib:0.16.0"
++    compileOnly "org.teavm:teavm-extension-spi:0.16.0"
++}
++
++java{
++    sourceCompatibility = JavaVersion.VERSION_17
++    targetCompatibility = JavaVersion.VERSION_17
++}
++
++teavm{
++    js{
++        mainClass = 'mindustry.web.WebLauncher'
++        targetFileName = 'mindustry.js'
++        obfuscated = !project.hasProperty('debugJs')
++        sourceMap = project.hasProperty('debugJs')
++        optimization = org.teavm.gradle.api.OptimizationLevel.BALANCED
++        processMemory = 6000
++    }
++}
+diff --git a/port/web/gradle.properties b/port/web/gradle.properties
+new file mode 100644
+index 0000000..8f0e427
+--- /dev/null
++++ b/port/web/gradle.properties
+@@ -0,0 +1 @@
++org.gradle.jvmargs=-Xmx11g
+diff --git a/port/web/settings.gradle b/port/web/settings.gradle
+new file mode 100644
+index 0000000..964c2f7
+--- /dev/null
++++ b/port/web/settings.gradle
+@@ -0,0 +1,7 @@
++pluginManagement{
++    repositories{
++        mavenCentral()
++        gradlePluginPortal()
++    }
++}
++rootProject.name = 'mindustry-web'
+diff --git a/port/web/src/main/java/mindustry/web/Shims.java b/port/web/src/main/java/mindustry/web/Shims.java
+new file mode 100644
+index 0000000..a36ada6
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/Shims.java
+@@ -0,0 +1,61 @@
++package mindustry.web;
++
++import java.net.*;
++
++/** Replacements for JDK methods missing from the browser class library (see {@link WebPlugin}). */
++public class Shims{
++    public static boolean isAnonymousClass(Class<?> type){
++        String name = type.getName();
++        int i = name.lastIndexOf('$');
++        if(i < 0 || i == name.length() - 1) return false;
++        for(int j = i + 1; j < name.length(); j++){
++            if(!Character.isDigit(name.charAt(j))) return false;
++        }
++        return true;
++    }
++
++    public static URL getResource(Class<?> type, String name){
++        return null;
++    }
++
++    /** Memory mapping doesn't exist here; callers fall back to reading the file. */
++    public static java.nio.ByteBuffer map(arc.files.Fi file){
++        throw new arc.util.ArcRuntimeException("Cannot map files in the browser: " + file);
++    }
++
++    public static long maxMemory(Runtime runtime){
++        return 2048L * 1024 * 1024;
++    }
++
++    public static void sleep(long ms, int nanos) throws InterruptedException{
++        Thread.sleep(ms + (nanos >= 500_000 ? 1 : 0));
++    }
++
++    /** Logged errors carry the JS stack of each cause, since the Java one is empty here. */
++    public static void printStackTrace(Throwable e, java.io.PrintWriter out){
++        out.print(getStackTrace(e));
++        out.flush();
++    }
++
++    public static String getStackTrace(Throwable e){
++        java.io.StringWriter out = new java.io.StringWriter();
++        e.printStackTrace(new java.io.PrintWriter(out));
++        for(Throwable c = e; c != null; c = c.getCause()){
++            String stack = WebHost.jsStack(c);
++            if(!stack.isEmpty()) out.append("\n--- ").append(String.valueOf(c)).append("\n").append(stack);
++        }
++        return out.toString();
++    }
++
++    public static long inflaterSkip(java.io.InputStream in, long n) throws java.io.IOException{
++        if(n < 0) throw new IllegalArgumentException();
++        byte[] buffer = new byte[(int)Math.min(n, 4096)];
++        long count = 0;
++        while(count < n){
++            int x = in.read(buffer, 0, (int)Math.min(n - count, buffer.length));
++            if(x == -1) break;
++            count += x;
++        }
++        return count;
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebApplication.java b/port/web/src/main/java/mindustry/web/WebApplication.java
+new file mode 100644
+index 0000000..e8713b7
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebApplication.java
+@@ -0,0 +1,158 @@
++package mindustry.web;
++
++import arc.*;
++import arc.audio.*;
++import arc.func.*;
++import arc.struct.*;
++import arc.util.*;
++import org.teavm.interop.*;
++import org.teavm.jso.*;
++import org.teavm.jso.browser.*;
++
++/** Runs the Arc application loop on requestAnimationFrame. */
++public class WebApplication implements Application{
++    private final Seq<ApplicationListener> listeners = new Seq<>();
++    private final TaskQueue runnables = new TaskQueue();
++    private final Thread mainThread;
++
++    final WebGraphics graphics;
++    final WebInput input;
++    boolean running = true, paused;
++
++    public WebApplication(ApplicationListener listener){
++        listeners.add(listener);
++        mainThread = Thread.currentThread();
++
++        Core.app = this;
++        Core.files = new WebFiles();
++        Core.graphics = graphics = new WebGraphics(WebHost.canvas());
++        Core.input = input = new WebInput(WebHost.canvas(), graphics);
++        Core.settings = new Settings();
++        Core.audio = new Audio(true);
++
++        WebHost.onVisibility(this::visibility);
++    }
++
++    void visibility(boolean visible){
++        if(visible == !paused) return;
++        paused = !visible;
++        if(paused){
++            listen(ApplicationListener::pause);
++            WebLauncher.storage.flush();
++        }else{
++            listen(ApplicationListener::resume);
++        }
++    }
++
++    public void run(){
++        boolean first = true;
++        try{
++            graphics.update();
++            graphics.updateSize();
++            listen(ApplicationListener::init);
++        }catch(Throwable t){
++            running = false;
++            WebHost.crash(t);
++            throw t;
++        }
++
++        while(running){
++            waitFrame();
++            try{
++                frame();
++                if(first){
++                    first = false;
++                    WebHost.ready();
++                }
++            }catch(Throwable t){
++                running = false;
++                WebHost.crash(t);
++                throw t;
++            }
++        }
++        listen(l -> {
++            l.pause();
++            l.dispose();
++        });
++    }
++
++    void frame(){
++        if(graphics.updateSize()){
++            listen(l -> l.resize(graphics.getWidth(), graphics.getHeight()));
++        }
++        graphics.update();
++        input.update();
++        defaultUpdate();
++        listen(ApplicationListener::update);
++        runnables.run();
++        input.postUpdate();
++        WebLauncher.storage.tick();
++        WebMusic.update();
++    }
++
++    @Async
++    static native void waitFrame();
++
++    static void waitFrame(AsyncCallback<Void> callback){
++        Window.requestAnimationFrame(time -> callback.complete(null));
++    }
++
++    private void listen(Cons<ApplicationListener> cons){
++        for(ApplicationListener l : listeners){
++            cons.get(l);
++        }
++    }
++
++    @Override
++    public Seq<ApplicationListener> getListeners(){
++        return listeners;
++    }
++
++    @Override
++    public ApplicationType getType(){
++        return ApplicationType.web;
++    }
++
++    @Override
++    public Thread getMainThread(){
++        return mainThread;
++    }
++
++    @Override
++    public boolean isOnMainThread(){
++        return true;
++    }
++
++    @Override
++    public String getClipboardText(){
++        return WebHost.clipboard;
++    }
++
++    @Override
++    public void setClipboardText(String text){
++        WebHost.clipboard = text;
++        WebHost.writeClipboard(text);
++    }
++
++    @Override
++    public boolean openURI(String uri){
++        if(uri == null || uri.isEmpty()) return false;
++        WebHost.openURI(uri);
++        return true;
++    }
++
++    @Override
++    public void post(Runnable runnable){
++        runnables.post(runnable);
++    }
++
++    @Override
++    public void exit(){
++        //after importing data the game asks to start over: the page restarts it once the files are saved
++        WebLauncher.storage.flush();
++        WebHost.exit();
++    }
++
++    @JSBody(script = "return performance.now();")
++    static native double now();
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebFileSystem.java b/port/web/src/main/java/mindustry/web/WebFileSystem.java
+new file mode 100644
+index 0000000..79143fa
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebFileSystem.java
+@@ -0,0 +1,367 @@
++package mindustry.web;
++
++import org.teavm.runtime.fs.*;
++
++import java.io.*;
++import java.util.*;
++
++/**
++ * In-memory file system behind java.io.File. The game's assets are mounted read-only under /assets
++ * straight from the downloaded bundle (no copies); everything under /data is the player's and is
++ * mirrored to IndexedDB by {@link WebStorage}.
++ */
++public class WebFileSystem implements VirtualFileSystem{
++    public static final String dataRoot = "/data";
++    /** Files the game exports land here and are handed to the browser as downloads. */
++    public static final String downloadRoot = "/downloads";
++
++    final Dir root = new Dir("", null);
++    /** Paths under /data written or deleted since the last flush. */
++    final Set<String> dirty = new LinkedHashSet<>();
++
++    public static WebFileSystem install(){
++        WebFileSystem fs = new WebFileSystem();
++        VirtualFileSystemProvider.setInstance(fs);
++        return fs;
++    }
++
++    @Override
++    public String getUserDir(){
++        //code that builds plain internal Fi objects (new Fi("version.properties", internal)) reads relative to here
++        return "/assets";
++    }
++
++    @Override
++    public VirtualFile getFile(String path){
++        return new FileRef(normalize(path));
++    }
++
++    @Override
++    public boolean isWindows(){
++        return false;
++    }
++
++    @Override
++    public String canonicalize(String path){
++        return normalize(path);
++    }
++
++    @Override
++    public String[] getRoots(){
++        return new String[]{"/"};
++    }
++
++    static String normalize(String path){
++        if(path.isEmpty()) return "/";
++        String[] parts = path.split("/");
++        ArrayList<String> out = new ArrayList<>();
++        for(String part : parts){
++            if(part.isEmpty() || part.equals(".")) continue;
++            if(part.equals("..")){
++                if(!out.isEmpty()) out.remove(out.size() - 1);
++            }else{
++                out.add(part);
++            }
++        }
++        StringBuilder b = new StringBuilder();
++        for(String p : out) b.append('/').append(p);
++        return b.length() == 0 ? "/" : b.toString();
++    }
++
++    Node find(String path){
++        if(path.equals("/")) return root;
++        Node node = root;
++        int start = 1;
++        while(node instanceof Dir){
++            int end = path.indexOf('/', start);
++            String name = end < 0 ? path.substring(start) : path.substring(start, end);
++            node = ((Dir)node).children.get(name);
++            if(node == null || end < 0) return node;
++            start = end + 1;
++        }
++        return null;
++    }
++
++    Dir mkdirs(String path){
++        Node node = root;
++        if(path.equals("/")) return root;
++        for(String part : path.substring(1).split("/")){
++            Dir dir = (Dir)node;
++            Node next = dir.children.get(part);
++            if(next == null){
++                next = new Dir(part, dir);
++                dir.children.put(part, next);
++            }
++            node = next;
++        }
++        return (Dir)node;
++    }
++
++    /** Mounts a file without copying it (used for the asset bundle and restored saves). */
++    public void put(String path, byte[] data, int length, long modified, boolean track){
++        path = normalize(path);
++        int slash = path.lastIndexOf('/');
++        Dir dir = mkdirs(slash <= 0 ? "/" : path.substring(0, slash));
++        String name = path.substring(slash + 1);
++        FileNode file = new FileNode(name, dir);
++        file.data = data;
++        file.size = length;
++        file.modified = modified;
++        dir.children.put(name, file);
++        if(track) markDirty(path);
++    }
++
++    void markDirty(String path){
++        if(path.startsWith(dataRoot + "/") || path.startsWith(downloadRoot + "/")) dirty.add(path);
++    }
++
++    public String[] takeDirty(){
++        String[] out = dirty.toArray(new String[0]);
++        dirty.clear();
++        return out;
++    }
++
++    /** @return file contents, or null if the path is not a file. The array may be longer than the file. */
++    public FileNode file(String path){
++        Node node = find(normalize(path));
++        return node instanceof FileNode f ? f : null;
++    }
++
++    static abstract class Node{
++        String name;
++        Dir parent;
++        long modified = System.currentTimeMillis();
++        boolean readOnly;
++
++        Node(String name, Dir parent){
++            this.name = name;
++            this.parent = parent;
++        }
++
++        String path(){
++            if(parent == null) return "/";
++            String p = parent.path();
++            return (p.equals("/") ? "" : p) + "/" + name;
++        }
++    }
++
++    static class Dir extends Node{
++        final LinkedHashMap<String, Node> children = new LinkedHashMap<>();
++
++        Dir(String name, Dir parent){
++            super(name, parent);
++        }
++    }
++
++    public static class FileNode extends Node{
++        public byte[] data = new byte[0];
++        public int size;
++
++        FileNode(String name, Dir parent){
++            super(name, parent);
++        }
++
++        void ensure(int capacity){
++            if(data.length < capacity){
++                data = Arrays.copyOf(data, Math.max(capacity, data.length * 2));
++            }
++        }
++    }
++
++    class FileRef implements VirtualFile{
++        final String path;
++
++        FileRef(String path){
++            this.path = path;
++        }
++
++        @Override
++        public String getName(){
++            return path.substring(path.lastIndexOf('/') + 1);
++        }
++
++        @Override
++        public boolean isDirectory(){
++            return find(path) instanceof Dir;
++        }
++
++        @Override
++        public boolean isFile(){
++            return find(path) instanceof FileNode;
++        }
++
++        @Override
++        public String[] listFiles(){
++            Node node = find(path);
++            if(!(node instanceof Dir dir)) return null;
++            return dir.children.keySet().toArray(new String[0]);
++        }
++
++        @Override
++        public VirtualFileAccessor createAccessor(boolean readable, boolean writable, boolean append){
++            Node node = find(path);
++            if(!(node instanceof FileNode file)) return null;
++            if(writable && file.readOnly) return null;
++            return new Accessor(file, path, append);
++        }
++
++        @Override
++        public boolean createFile(String fileName) throws IOException{
++            Node node = find(path);
++            if(!(node instanceof Dir dir)) throw new IOException("Not a directory: " + path);
++            if(dir.children.containsKey(fileName)) return false;
++            dir.children.put(fileName, new FileNode(fileName, dir));
++            markDirty((path.equals("/") ? "" : path) + "/" + fileName);
++            return true;
++        }
++
++        @Override
++        public boolean createDirectory(String fileName){
++            Node node = find(path);
++            if(!(node instanceof Dir dir) || dir.children.containsKey(fileName)) return false;
++            dir.children.put(fileName, new Dir(fileName, dir));
++            return true;
++        }
++
++        @Override
++        public boolean delete(){
++            Node node = find(path);
++            if(node == null || node.parent == null || node.readOnly) return false;
++            if(node instanceof Dir dir && !dir.children.isEmpty()) return false;
++            node.parent.children.remove(node.name);
++            markDirty(path);
++            return true;
++        }
++
++        @Override
++        public boolean adopt(VirtualFile file, String fileName){
++            Node node = find(path);
++            Node other = find(((FileRef)file).path);
++            if(!(node instanceof Dir dir) || other == null || other.parent == null) return false;
++            String oldPath = other.path();
++            other.parent.children.remove(other.name);
++            other.name = fileName;
++            other.parent = dir;
++            dir.children.put(fileName, other);
++            markTree(oldPath, other);
++            markTree(other.path(), other);
++            return true;
++        }
++
++        void markTree(String at, Node node){
++            markDirty(at);
++            if(node instanceof Dir dir){
++                for(Node child : dir.children.values()){
++                    markTree(at + "/" + child.name, child);
++                }
++            }
++        }
++
++        @Override
++        public boolean canRead(){
++            return find(path) != null;
++        }
++
++        @Override
++        public boolean canWrite(){
++            Node node = find(path);
++            return node != null && !node.readOnly;
++        }
++
++        @Override
++        public long lastModified(){
++            Node node = find(path);
++            return node == null ? 0 : node.modified;
++        }
++
++        @Override
++        public boolean setLastModified(long lastModified){
++            Node node = find(path);
++            if(node == null) return false;
++            node.modified = lastModified;
++            return true;
++        }
++
++        @Override
++        public boolean setReadOnly(boolean readOnly){
++            Node node = find(path);
++            if(node == null) return false;
++            node.readOnly = readOnly;
++            return true;
++        }
++
++        @Override
++        public int length(){
++            Node node = find(path);
++            return node instanceof FileNode f ? f.size : 0;
++        }
++    }
++
++    class Accessor implements VirtualFileAccessor{
++        final FileNode file;
++        final String path;
++        int pos;
++
++        Accessor(FileNode file, String path, boolean append){
++            this.file = file;
++            this.path = path;
++            if(append) pos = file.size;
++        }
++
++        @Override
++        public int read(byte[] buffer, int offset, int limit){
++            int n = Math.min(limit, file.size - pos);
++            if(n <= 0) return -1;
++            System.arraycopy(file.data, pos, buffer, offset, n);
++            pos += n;
++            return n;
++        }
++
++        @Override
++        public void write(byte[] buffer, int offset, int limit){
++            file.ensure(pos + limit);
++            System.arraycopy(buffer, offset, file.data, pos, limit);
++            pos += limit;
++            if(pos > file.size) file.size = pos;
++            file.modified = System.currentTimeMillis();
++            markDirty(path);
++        }
++
++        @Override
++        public int tell(){
++            return pos;
++        }
++
++        @Override
++        public void seek(int target){
++            pos = target;
++        }
++
++        @Override
++        public void skip(int amount){
++            pos += amount;
++        }
++
++        @Override
++        public int size(){
++            return file.size;
++        }
++
++        @Override
++        public void resize(int size){
++            file.ensure(size);
++            if(size > file.size) Arrays.fill(file.data, file.size, size, (byte)0);
++            file.size = size;
++            if(pos > size) pos = size;
++            markDirty(path);
++        }
++
++        @Override
++        public void close(){
++        }
++
++        @Override
++        public void flush(){
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebFiles.java b/port/web/src/main/java/mindustry/web/WebFiles.java
+new file mode 100644
+index 0000000..5370ab0
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebFiles.java
+@@ -0,0 +1,115 @@
++package mindustry.web;
++
++import arc.*;
++import arc.files.*;
++
++import java.io.*;
++
++/** Internal and classpath files live under /assets, local and external ones under /data. */
++public class WebFiles implements Files{
++    public static final String assetsPath = "/assets/";
++    public static final String localPath = WebFileSystem.dataRoot + "/";
++
++    @Override
++    public Fi get(String fileName, FileType type){
++        return new WebFi(fileName, type);
++    }
++
++    @Override
++    public String getExternalStoragePath(){
++        return localPath;
++    }
++
++    @Override
++    public boolean isExternalStorageAvailable(){
++        return true;
++    }
++
++    @Override
++    public String getLocalStoragePath(){
++        return localPath;
++    }
++
++    @Override
++    public boolean isLocalStorageAvailable(){
++        return true;
++    }
++
++    public static class WebFi extends Fi{
++        public WebFi(String fileName, FileType type){
++            super(fileName, type);
++        }
++
++        public WebFi(File file, FileType type){
++            super(file, type);
++        }
++
++        @Override
++        public Fi child(String name){
++            if(file.getPath().length() == 0) return new WebFi(new File(name), type);
++            return new WebFi(new File(file, name), type);
++        }
++
++        @Override
++        public Fi sibling(String name){
++            return new WebFi(new File(file.getParent(), name), type);
++        }
++
++        @Override
++        public Fi parent(){
++            File parent = file.getParentFile();
++            if(parent == null){
++                parent = type == FileType.absolute ? new File("/") : new File("");
++            }
++            return new WebFi(parent, type);
++        }
++
++        @Override
++        public File file(){
++            switch(type){
++                case internal:
++                case classpath:
++                    return new File(assetsPath, file.getPath());
++                case local:
++                case external:
++                    return new File(localPath, file.getPath());
++                default:
++                    return file;
++            }
++        }
++
++        @Override
++        public InputStream read(){
++            try{
++                return new FileInputStream(file());
++            }catch(Exception e){
++                if(file().isDirectory()) throw new arc.util.ArcRuntimeException("Cannot open a stream to a directory: " + file + " (" + type + ")", e);
++                throw new arc.util.ArcRuntimeException("Error reading file: " + file + " (" + type + ")", e);
++            }
++        }
++
++        @Override
++        public byte[] readBytes(){
++            WebFileSystem.FileNode node = WebLauncher.fs.file(file().getPath());
++            if(node == null) throw new arc.util.ArcRuntimeException("File not found: " + file + " (" + type + ")");
++            byte[] out = new byte[node.size];
++            System.arraycopy(node.data, 0, out, 0, node.size);
++            return out;
++        }
++
++        @Override
++        public long length(){
++            return file().length();
++        }
++
++        @Override
++        public boolean exists(){
++            return file().exists();
++        }
++
++        @Override
++        public boolean isDirectory(){
++            return file().isDirectory();
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebGL20.java b/port/web/src/main/java/mindustry/web/WebGL20.java
+new file mode 100644
+index 0000000..8481b1f
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebGL20.java
+@@ -0,0 +1,1071 @@
++package mindustry.web;
++
++import arc.graphics.*;
++import org.teavm.jso.*;
++import org.teavm.jso.webgl.*;
++
++import java.nio.*;
++import java.util.*;
++
++/**
++ * GL20 on a WebGL 2 context. GL object names are small ints mapped to WebGL objects; the
++ * int is stored on the object as $id so getParameter results can be mapped back.
++ */
++public class WebGL20 implements GL20{
++    final WebGLRenderingContext gl;
++    private final ArrayList<JSObject> objects = new ArrayList<>();
++    private final ArrayList<Integer> free = new ArrayList<>();
++    private final ArrayList<WebGLUniformLocation> uniforms = new ArrayList<>();
++    private final HashMap<Integer, HashMap<String, Integer>> uniformIds = new HashMap<>();
++
++    public WebGL20(WebGLRenderingContext gl){
++        this.gl = gl;
++        objects.add(null);
++        uniforms.add(null);
++    }
++
++    int add(JSObject obj){
++        if(obj == null) return 0;
++        int id;
++        if(!free.isEmpty()){
++            id = free.remove(free.size() - 1);
++            objects.set(id, obj);
++        }else{
++            id = objects.size();
++            objects.add(obj);
++        }
++        setId(obj, id);
++        return id;
++    }
++
++    @SuppressWarnings("unchecked")
++    <T extends JSObject> T get(int id){
++        return id <= 0 || id >= objects.size() ? null : (T)objects.get(id);
++    }
++
++    void remove(int id){
++        if(id > 0 && id < objects.size() && objects.get(id) != null){
++            objects.set(id, null);
++            free.add(id);
++        }
++    }
++
++    @JSBody(params = {"obj", "id"}, script = "obj.$id = id;")
++    static native void setId(JSObject obj, int id);
++
++    @JSBody(params = "obj", script = "return obj && obj.$id ? obj.$id : 0;")
++    static native int getId(JSObject obj);
++
++    static int elementSize(Buffer buffer){
++        if(buffer instanceof ByteBuffer) return 1;
++        if(buffer instanceof ShortBuffer || buffer instanceof CharBuffer) return 2;
++        if(buffer instanceof DoubleBuffer || buffer instanceof LongBuffer) return 8;
++        return 4;
++    }
++
++    /** Byte range of a buffer starting at its position: 0 = Uint8, 1 = Uint16, 2 = Float32, 3 = Int32 */
++    @JSBody(params = {"view", "offset", "length", "kind"}, script =
++        "var b = view.buffer, o = view.byteOffset + offset;" +
++        "if(kind == 1) return new Uint16Array(b, o, length >> 1);" +
++        "if(kind == 2) return new Float32Array(b, o, length >> 2);" +
++        "if(kind == 3) return new Int32Array(b, o, length >> 2);" +
++        "return new Uint8Array(b, o, length);")
++    static native JSObject slice(@JSBuffer(JSBufferType.DATA_VIEW) Buffer view, int offset, int length, int kind);
++
++    static JSObject bytes(Buffer buffer, int byteLength, int kind){
++        int size = elementSize(buffer);
++        int offset = buffer.position() * size;
++        if(byteLength < 0) byteLength = buffer.remaining() * size;
++        return slice(buffer, offset, byteLength, kind);
++    }
++
++    static int kindFor(int type){
++        switch(type){
++            case GL_UNSIGNED_SHORT:
++            case GL_UNSIGNED_SHORT_4_4_4_4:
++            case GL_UNSIGNED_SHORT_5_5_5_1:
++            case GL_UNSIGNED_SHORT_5_6_5:
++            case 0x8D61: //half float (GLES 3)
++            case 0x140B: //half float
++                return 1;
++            case GL_FLOAT:
++                return 2;
++            case GL_INT:
++            case GL_UNSIGNED_INT:
++                return 3;
++            default:
++                return 0;
++        }
++    }
++
++    static int bytesPerPixel(int format, int type){
++        int channels;
++        switch(format){
++            case GL_ALPHA:
++            case GL_LUMINANCE:
++            case 0x1903: //red
++                channels = 1;
++                break;
++            case GL_LUMINANCE_ALPHA:
++            case 0x8227: //rg
++                channels = 2;
++                break;
++            case GL_RGB:
++                channels = 3;
++                break;
++            default:
++                channels = 4;
++        }
++        switch(type){
++            case GL_UNSIGNED_SHORT_4_4_4_4:
++            case GL_UNSIGNED_SHORT_5_5_5_1:
++            case GL_UNSIGNED_SHORT_5_6_5:
++                return 2;
++            case GL_FLOAT:
++                return channels * 4;
++            case 0x8D61:
++            case 0x140B:
++                return channels * 2;
++            default:
++                return channels;
++        }
++    }
++
++    @Override
++    public void glActiveTexture(int texture){
++        gl.activeTexture(texture);
++    }
++
++    @Override
++    public void glBindTexture(int target, int texture){
++        gl.bindTexture(target, get(texture));
++    }
++
++    @Override
++    public void glBlendFunc(int sfactor, int dfactor){
++        gl.blendFunc(sfactor, dfactor);
++    }
++
++    @Override
++    public void glClear(int mask){
++        gl.clear(mask);
++    }
++
++    @Override
++    public void glClearColor(float red, float green, float blue, float alpha){
++        gl.clearColor(red, green, blue, alpha);
++    }
++
++    @Override
++    public void glClearDepthf(float depth){
++        gl.clearDepth(depth);
++    }
++
++    @Override
++    public void glClearStencil(int s){
++        gl.clearStencil(s);
++    }
++
++    @Override
++    public void glColorMask(boolean red, boolean green, boolean blue, boolean alpha){
++        gl.colorMask(red, green, blue, alpha);
++    }
++
++    @Override
++    public void glCompressedTexImage2D(int target, int level, int internalformat, int width, int height, int border, int imageSize, Buffer data){
++        compressedTexImage2D(gl, target, level, internalformat, width, height, border, bytes(data, imageSize, 0));
++    }
++
++    @JSBody(params = {"gl", "target", "level", "internalformat", "width", "height", "border", "data"}, script = "gl.compressedTexImage2D(target, level, internalformat, width, height, border, data);")
++    static native void compressedTexImage2D(WebGLRenderingContext gl, int target, int level, int internalformat, int width, int height, int border, JSObject data);
++
++    @Override
++    public void glCompressedTexSubImage2D(int target, int level, int xoffset, int yoffset, int width, int height, int format, int imageSize, Buffer data){
++        compressedTexSubImage2D(gl, target, level, xoffset, yoffset, width, height, format, bytes(data, imageSize, 0));
++    }
++
++    @JSBody(params = {"gl", "target", "level", "x", "y", "width", "height", "format", "data"}, script = "gl.compressedTexSubImage2D(target, level, x, y, width, height, format, data);")
++    static native void compressedTexSubImage2D(WebGLRenderingContext gl, int target, int level, int x, int y, int width, int height, int format, JSObject data);
++
++    @Override
++    public void glCopyTexImage2D(int target, int level, int internalformat, int x, int y, int width, int height, int border){
++        gl.copyTexImage2D(target, level, internalformat, x, y, width, height, border);
++    }
++
++    @Override
++    public void glCopyTexSubImage2D(int target, int level, int xoffset, int yoffset, int x, int y, int width, int height){
++        gl.copyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
++    }
++
++    @Override
++    public void glCullFace(int mode){
++        gl.cullFace(mode);
++    }
++
++    @Override
++    public void glDeleteTexture(int texture){
++        gl.deleteTexture(get(texture));
++        remove(texture);
++    }
++
++    @Override
++    public void glDepthFunc(int func){
++        gl.depthFunc(func);
++    }
++
++    @Override
++    public void glDepthMask(boolean flag){
++        gl.depthMask(flag);
++    }
++
++    @Override
++    public void glDepthRangef(float zNear, float zFar){
++        gl.depthRange(zNear, zFar);
++    }
++
++    @Override
++    public void glDisable(int cap){
++        gl.disable(cap);
++    }
++
++    @Override
++    public void glDrawArrays(int mode, int first, int count){
++        gl.drawArrays(mode, first, count);
++    }
++
++    @Override
++    public void glDrawElements(int mode, int count, int type, Buffer indices){
++        //client-side index arrays don't exist in WebGL; Mesh always uses buffers here
++        gl.drawElements(mode, count, type, indices.position() * elementSize(indices));
++    }
++
++    @Override
++    public void glEnable(int cap){
++        gl.enable(cap);
++    }
++
++    @Override
++    public void glFinish(){
++        gl.finish();
++    }
++
++    @Override
++    public void glFlush(){
++        gl.flush();
++    }
++
++    @Override
++    public void glFrontFace(int mode){
++        gl.frontFace(mode);
++    }
++
++    @Override
++    public int glGenTexture(){
++        return add(gl.createTexture());
++    }
++
++    @Override
++    public int glGetError(){
++        return gl.getError();
++    }
++
++    @Override
++    public void glGetIntegerv(int pname, IntBuffer params){
++        int pos = params.position();
++        switch(pname){
++            case GL_VIEWPORT:
++            case GL_SCISSOR_BOX:
++            case 0x846D: //aliased point size range
++            case GL_ALIASED_LINE_WIDTH_RANGE:
++            case GL_MAX_VIEWPORT_DIMS:
++                int[] values = intArray(gl, pname);
++                for(int i = 0; i < values.length && pos + i < params.limit(); i++) params.put(pos + i, values[i]);
++                break;
++            case GL_FRAMEBUFFER_BINDING:
++            case GL_RENDERBUFFER_BINDING:
++            case GL_TEXTURE_BINDING_2D:
++            case GL_TEXTURE_BINDING_CUBE_MAP:
++            case GL_ARRAY_BUFFER_BINDING:
++            case GL_ELEMENT_ARRAY_BUFFER_BINDING:
++            case GL_CURRENT_PROGRAM:
++                params.put(pos, getId(gl.getParameter(pname)));
++                break;
++            default:
++                params.put(pos, intParameter(gl, pname));
++        }
++    }
++
++    @JSBody(params = {"gl", "pname"}, script = "var v = gl.getParameter(pname); return v == null ? [] : Array.from(v, function(x){ return x | 0; });")
++    static native int[] intArray(WebGLRenderingContext gl, int pname);
++
++    @JSBody(params = {"gl", "pname"}, script = "var v = gl.getParameter(pname); return typeof v === 'boolean' ? (v ? 1 : 0) : (v | 0);")
++    static native int intParameter(WebGLRenderingContext gl, int pname);
++
++    @Override
++    public String glGetString(int name){
++        String s = stringParameter(gl, name);
++        return s == null ? "" : s;
++    }
++
++    @JSBody(params = {"gl", "pname"}, script = "var v = gl.getParameter(pname); return v == null ? null : '' + v;")
++    static native String stringParameter(WebGLRenderingContext gl, int pname);
++
++    @Override
++    public void glHint(int target, int mode){
++        gl.hint(target, mode);
++    }
++
++    @Override
++    public void glLineWidth(float width){
++        gl.lineWidth(width);
++    }
++
++    @Override
++    public void glPixelStorei(int pname, int param){
++        gl.pixelStorei(pname, param);
++    }
++
++    @Override
++    public void glPolygonOffset(float factor, float units){
++        gl.polygonOffset(factor, units);
++    }
++
++    @Override
++    public void glReadPixels(int x, int y, int width, int height, int format, int type, Buffer pixels){
++        readPixels(gl, x, y, width, height, format, type, bytes(pixels, width * height * bytesPerPixel(format, type), kindFor(type)));
++    }
++
++    @JSBody(params = {"gl", "x", "y", "w", "h", "format", "type", "data"}, script = "gl.readPixels(x, y, w, h, format, type, data);")
++    static native void readPixels(WebGLRenderingContext gl, int x, int y, int w, int h, int format, int type, JSObject data);
++
++    @Override
++    public void glScissor(int x, int y, int width, int height){
++        gl.scissor(x, y, width, height);
++    }
++
++    @Override
++    public void glStencilFunc(int func, int ref, int mask){
++        gl.stencilFunc(func, ref, mask);
++    }
++
++    @Override
++    public void glStencilMask(int mask){
++        gl.stencilMask(mask);
++    }
++
++    @Override
++    public void glStencilOp(int fail, int zfail, int zpass){
++        gl.stencilOp(fail, zfail, zpass);
++    }
++
++    @Override
++    public void glTexImage2D(int target, int level, int internalformat, int width, int height, int border, int format, int type, Buffer pixels){
++        if(pixels == null){
++            texImage2D(gl, target, level, internalformat, width, height, border, format, type, null);
++        }else{
++            texImage2D(gl, target, level, internalformat, width, height, border, format, type, bytes(pixels, width * height * bytesPerPixel(format, type), kindFor(type)));
++        }
++    }
++
++    @JSBody(params = {"gl", "target", "level", "internalformat", "w", "h", "border", "format", "type", "data"}, script = "gl.texImage2D(target, level, internalformat, w, h, border, format, type, data);")
++    static native void texImage2D(WebGLRenderingContext gl, int target, int level, int internalformat, int w, int h, int border, int format, int type, JSObject data);
++
++    @Override
++    public void glTexParameterf(int target, int pname, float param){
++        gl.texParameterf(target, pname, param);
++    }
++
++    @Override
++    public void glTexSubImage2D(int target, int level, int xoffset, int yoffset, int width, int height, int format, int type, Buffer pixels){
++        texSubImage2D(gl, target, level, xoffset, yoffset, width, height, format, type, bytes(pixels, width * height * bytesPerPixel(format, type), kindFor(type)));
++    }
++
++    @JSBody(params = {"gl", "target", "level", "x", "y", "w", "h", "format", "type", "data"}, script = "gl.texSubImage2D(target, level, x, y, w, h, format, type, data);")
++    static native void texSubImage2D(WebGLRenderingContext gl, int target, int level, int x, int y, int w, int h, int format, int type, JSObject data);
++
++    @Override
++    public void glViewport(int x, int y, int width, int height){
++        gl.viewport(x, y, width, height);
++    }
++
++    @Override
++    public void glAttachShader(int program, int shader){
++        gl.attachShader(get(program), get(shader));
++    }
++
++    @Override
++    public void glBindAttribLocation(int program, int index, String name){
++        gl.bindAttribLocation(get(program), index, name);
++    }
++
++    @Override
++    public void glBindBuffer(int target, int buffer){
++        gl.bindBuffer(target, get(buffer));
++    }
++
++    @Override
++    public void glBindFramebuffer(int target, int framebuffer){
++        gl.bindFramebuffer(target, get(framebuffer));
++    }
++
++    @Override
++    public void glBindRenderbuffer(int target, int renderbuffer){
++        gl.bindRenderbuffer(target, get(renderbuffer));
++    }
++
++    @Override
++    public void glBlendColor(float red, float green, float blue, float alpha){
++        gl.blendColor(red, green, blue, alpha);
++    }
++
++    @Override
++    public void glBlendEquation(int mode){
++        gl.blendEquation(mode);
++    }
++
++    @Override
++    public void glBlendEquationSeparate(int modeRGB, int modeAlpha){
++        gl.blendEquationSeparate(modeRGB, modeAlpha);
++    }
++
++    @Override
++    public void glBlendFuncSeparate(int srcRGB, int dstRGB, int srcAlpha, int dstAlpha){
++        gl.blendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
++    }
++
++    @Override
++    public void glBufferData(int target, int size, Buffer data, int usage){
++        if(data == null){
++            gl.bufferData(target, size, usage);
++        }else{
++            bufferData(gl, target, bytes(data, size, 0), usage);
++        }
++    }
++
++    @JSBody(params = {"gl", "target", "data", "usage"}, script = "gl.bufferData(target, data, usage);")
++    static native void bufferData(WebGLRenderingContext gl, int target, JSObject data, int usage);
++
++    @Override
++    public void glBufferSubData(int target, int offset, int size, Buffer data){
++        bufferSubData(gl, target, offset, bytes(data, size, 0));
++    }
++
++    @JSBody(params = {"gl", "target", "offset", "data"}, script = "gl.bufferSubData(target, offset, data);")
++    static native void bufferSubData(WebGLRenderingContext gl, int target, int offset, JSObject data);
++
++    @Override
++    public int glCheckFramebufferStatus(int target){
++        return gl.checkFramebufferStatus(target);
++    }
++
++    @Override
++    public void glCompileShader(int shader){
++        gl.compileShader(get(shader));
++    }
++
++    @Override
++    public int glCreateProgram(){
++        return add(gl.createProgram());
++    }
++
++    @Override
++    public int glCreateShader(int type){
++        return add(gl.createShader(type));
++    }
++
++    @Override
++    public void glDeleteBuffer(int buffer){
++        gl.deleteBuffer(get(buffer));
++        remove(buffer);
++    }
++
++    @Override
++    public void glDeleteFramebuffer(int framebuffer){
++        gl.deleteFramebuffer(get(framebuffer));
++        remove(framebuffer);
++    }
++
++    @Override
++    public void glDeleteProgram(int program){
++        gl.deleteProgram(get(program));
++        HashMap<String, Integer> ids = uniformIds.remove(program);
++        if(ids != null){
++            for(int id : ids.values()) if(id > 0) uniforms.set(id, null);
++        }
++        remove(program);
++    }
++
++    @Override
++    public void glDeleteRenderbuffer(int renderbuffer){
++        gl.deleteRenderbuffer(get(renderbuffer));
++        remove(renderbuffer);
++    }
++
++    @Override
++    public void glDeleteShader(int shader){
++        gl.deleteShader(get(shader));
++        remove(shader);
++    }
++
++    @Override
++    public void glDetachShader(int program, int shader){
++        gl.detachShader(get(program), get(shader));
++    }
++
++    @Override
++    public void glDisableVertexAttribArray(int index){
++        gl.disableVertexAttribArray(index);
++    }
++
++    @Override
++    public void glDrawElements(int mode, int count, int type, int indices){
++        gl.drawElements(mode, count, type, indices);
++    }
++
++    @Override
++    public void glEnableVertexAttribArray(int index){
++        gl.enableVertexAttribArray(index);
++    }
++
++    @Override
++    public void glFramebufferRenderbuffer(int target, int attachment, int renderbuffertarget, int renderbuffer){
++        gl.framebufferRenderbuffer(target, attachment, renderbuffertarget, get(renderbuffer));
++    }
++
++    @Override
++    public void glFramebufferTexture2D(int target, int attachment, int textarget, int texture, int level){
++        gl.framebufferTexture2D(target, attachment, textarget, get(texture), level);
++    }
++
++    @Override
++    public int glGenBuffer(){
++        return add(gl.createBuffer());
++    }
++
++    @Override
++    public void glGenerateMipmap(int target){
++        gl.generateMipmap(target);
++    }
++
++    @Override
++    public int glGenFramebuffer(){
++        return add(gl.createFramebuffer());
++    }
++
++    @Override
++    public int glGenRenderbuffer(){
++        return add(gl.createRenderbuffer());
++    }
++
++    @Override
++    public String glGetActiveAttrib(int program, int index, IntBuffer size, IntBuffer type){
++        WebGLActiveInfo info = gl.getActiveAttrib(get(program), index);
++        if(info == null) return null;
++        size.put(size.position(), info.getSize());
++        type.put(type.position(), info.getType());
++        return info.getName();
++    }
++
++    @Override
++    public String glGetActiveUniform(int program, int index, IntBuffer size, IntBuffer type){
++        WebGLActiveInfo info = gl.getActiveUniform(get(program), index);
++        if(info == null) return null;
++        size.put(size.position(), info.getSize());
++        type.put(type.position(), info.getType());
++        return info.getName();
++    }
++
++    @Override
++    public int glGetAttribLocation(int program, String name){
++        return gl.getAttribLocation(get(program), name);
++    }
++
++    @Override
++    public void glGetBooleanv(int pname, Buffer params){
++        int v = intParameter(gl, pname);
++        if(params instanceof ByteBuffer b) b.put(b.position(), (byte)v);
++        else if(params instanceof IntBuffer b) b.put(b.position(), v);
++    }
++
++    @Override
++    public void glGetBufferParameteriv(int target, int pname, IntBuffer params){
++        params.put(params.position(), toInt(gl.getBufferParameter(target, pname)));
++    }
++
++    @JSBody(params = "v", script = "return typeof v === 'boolean' ? (v ? 1 : 0) : (v | 0);")
++    static native int toInt(JSObject v);
++
++    @Override
++    public void glGetFloatv(int pname, FloatBuffer params){
++        float[] values = floatArray(gl, pname);
++        int pos = params.position();
++        for(int i = 0; i < values.length && pos + i < params.limit(); i++) params.put(pos + i, values[i]);
++    }
++
++    @JSBody(params = {"gl", "pname"}, script = "var v = gl.getParameter(pname); if(v == null) return []; if(typeof v === 'number') return [v]; return Array.from(v);")
++    static native float[] floatArray(WebGLRenderingContext gl, int pname);
++
++    @Override
++    public void glGetFramebufferAttachmentParameteriv(int target, int attachment, int pname, IntBuffer params){
++        params.put(params.position(), objectOrInt(gl.getFramebufferAttachmentParameter(target, attachment, pname)));
++    }
++
++    @JSBody(params = "v", script = "if(v == null) return 0; if(typeof v === 'object') return v.$id | 0; return typeof v === 'boolean' ? (v ? 1 : 0) : (v | 0);")
++    static native int objectOrInt(JSObject v);
++
++    @Override
++    public void glGetProgramiv(int program, int pname, IntBuffer params){
++        WebGLProgram p = get(program);
++        int value;
++        if(pname == GL_INFO_LOG_LENGTH){
++            String log = gl.getProgramInfoLog(p);
++            value = log == null ? 0 : log.length() + 1;
++        }else{
++            value = toInt(gl.getProgramParameter(p, pname));
++        }
++        params.put(params.position(), value);
++    }
++
++    @Override
++    public String glGetProgramInfoLog(int program){
++        String log = gl.getProgramInfoLog(get(program));
++        return log == null ? "" : log;
++    }
++
++    @Override
++    public void glGetRenderbufferParameteriv(int target, int pname, IntBuffer params){
++        params.put(params.position(), toInt(gl.getRenderbufferParameter(target, pname)));
++    }
++
++    @Override
++    public void glGetShaderiv(int shader, int pname, IntBuffer params){
++        WebGLShader s = get(shader);
++        int value;
++        if(pname == GL_INFO_LOG_LENGTH){
++            String log = gl.getShaderInfoLog(s);
++            value = log == null ? 0 : log.length() + 1;
++        }else{
++            value = toInt(gl.getShaderParameter(s, pname));
++        }
++        params.put(params.position(), value);
++    }
++
++    @Override
++    public String glGetShaderInfoLog(int shader){
++        String log = gl.getShaderInfoLog(get(shader));
++        return log == null ? "" : log;
++    }
++
++    @Override
++    public void glGetShaderPrecisionFormat(int shadertype, int precisiontype, IntBuffer range, IntBuffer precision){
++        WebGLShaderPrecisionFormat f = gl.getShaderPrecisionFormat(shadertype, precisiontype);
++        range.put(range.position(), f.getRangeMin());
++        range.put(range.position() + 1, f.getRangeMax());
++        precision.put(precision.position(), f.getPrecision());
++    }
++
++    @Override
++    public void glGetTexParameterfv(int target, int pname, FloatBuffer params){
++        params.put(params.position(), toFloat(gl.getTexParameter(target, pname)));
++    }
++
++    @JSBody(params = "v", script = "return +v || 0;")
++    static native float toFloat(JSObject v);
++
++    @Override
++    public void glGetTexParameteriv(int target, int pname, IntBuffer params){
++        params.put(params.position(), toInt(gl.getTexParameter(target, pname)));
++    }
++
++    @Override
++    public void glGetUniformfv(int program, int location, FloatBuffer params){
++        params.put(params.position(), toFloat(gl.getUniform(get(program), uniforms.get(location))));
++    }
++
++    @Override
++    public void glGetUniformiv(int program, int location, IntBuffer params){
++        params.put(params.position(), toInt(gl.getUniform(get(program), uniforms.get(location))));
++    }
++
++    @Override
++    public int glGetUniformLocation(int program, String name){
++        HashMap<String, Integer> ids = uniformIds.computeIfAbsent(program, k -> new HashMap<>());
++        Integer cached = ids.get(name);
++        if(cached != null) return cached;
++        WebGLUniformLocation loc = gl.getUniformLocation(get(program), name);
++        int id = -1;
++        if(loc != null){
++            id = uniforms.size();
++            uniforms.add(loc);
++        }
++        ids.put(name, id);
++        return id;
++    }
++
++    WebGLUniformLocation loc(int location){
++        return location <= 0 || location >= uniforms.size() ? null : uniforms.get(location);
++    }
++
++    @Override
++    public void glGetVertexAttribfv(int index, int pname, FloatBuffer params){
++        params.put(params.position(), toFloat(gl.getVertexAttrib(index, pname)));
++    }
++
++    @Override
++    public void glGetVertexAttribiv(int index, int pname, IntBuffer params){
++        params.put(params.position(), objectOrInt(gl.getVertexAttrib(index, pname)));
++    }
++
++    @Override
++    public boolean glIsBuffer(int buffer){
++        return buffer > 0 && gl.isBuffer(get(buffer));
++    }
++
++    @Override
++    public boolean glIsEnabled(int cap){
++        return gl.isEnabled(cap);
++    }
++
++    @Override
++    public boolean glIsFramebuffer(int framebuffer){
++        return framebuffer > 0 && gl.isFramebuffer(get(framebuffer));
++    }
++
++    @Override
++    public boolean glIsProgram(int program){
++        return program > 0 && gl.isProgram(get(program));
++    }
++
++    @Override
++    public boolean glIsRenderbuffer(int renderbuffer){
++        return renderbuffer > 0 && gl.isRenderbuffer(get(renderbuffer));
++    }
++
++    @Override
++    public boolean glIsShader(int shader){
++        return shader > 0 && gl.isShader(get(shader));
++    }
++
++    @Override
++    public boolean glIsTexture(int texture){
++        return texture > 0 && gl.isTexture(get(texture));
++    }
++
++    @Override
++    public void glLinkProgram(int program){
++        gl.linkProgram(get(program));
++    }
++
++    @Override
++    public void glReleaseShaderCompiler(){
++    }
++
++    @Override
++    public void glRenderbufferStorage(int target, int internalformat, int width, int height){
++        //GL_DEPTH24_STENCIL8_OES and friends: WebGL 2 knows them under the same numbers
++        gl.renderbufferStorage(target, internalformat, width, height);
++    }
++
++    @Override
++    public void glSampleCoverage(float value, boolean invert){
++        gl.sampleCoverage(value, invert);
++    }
++
++    @Override
++    public void glShaderSource(int shader, String string){
++        gl.shaderSource(get(shader), string);
++    }
++
++    @Override
++    public void glStencilFuncSeparate(int face, int func, int ref, int mask){
++        gl.stencilFuncSeparate(face, func, ref, mask);
++    }
++
++    @Override
++    public void glStencilMaskSeparate(int face, int mask){
++        gl.stencilMaskSeparate(face, mask);
++    }
++
++    @Override
++    public void glStencilOpSeparate(int face, int fail, int zfail, int zpass){
++        gl.stencilOpSeparate(face, fail, zfail, zpass);
++    }
++
++    @Override
++    public void glTexParameterfv(int target, int pname, FloatBuffer params){
++        gl.texParameterf(target, pname, params.get(params.position()));
++    }
++
++    @Override
++    public void glTexParameteri(int target, int pname, int param){
++        gl.texParameteri(target, pname, param);
++    }
++
++    @Override
++    public void glTexParameteriv(int target, int pname, IntBuffer params){
++        gl.texParameteri(target, pname, params.get(params.position()));
++    }
++
++    @JSBody(params = {"arr", "offset", "length"}, script = "return arr.subarray(offset, offset + length);")
++    static native JSObject sub(@JSByRef float[] arr, int offset, int length);
++
++    @JSBody(params = {"arr", "offset", "length"}, script = "return arr.subarray(offset, offset + length);")
++    static native JSObject sub(@JSByRef int[] arr, int offset, int length);
++
++    @JSBody(params = {"gl", "fn", "loc", "data"}, script = "gl[fn](loc, data);")
++    static native void uniformv(WebGLRenderingContext gl, String fn, WebGLUniformLocation loc, JSObject data);
++
++    @JSBody(params = {"gl", "fn", "loc", "transpose", "data"}, script = "gl[fn](loc, transpose, data);")
++    static native void uniformMatrix(WebGLRenderingContext gl, String fn, WebGLUniformLocation loc, boolean transpose, JSObject data);
++
++    void uniformf(String fn, int location, int count, int n, FloatBuffer v){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) uniformv(gl, fn, l, bytes(v, count * n * 4, 2));
++    }
++
++    void uniformf(String fn, int location, int count, int n, float[] v, int offset){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) uniformv(gl, fn, l, sub(v, offset, count * n));
++    }
++
++    void uniformi(String fn, int location, int count, int n, IntBuffer v){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) uniformv(gl, fn, l, bytes(v, count * n * 4, 3));
++    }
++
++    void uniformi(String fn, int location, int count, int n, int[] v, int offset){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) uniformv(gl, fn, l, sub(v, offset, count * n));
++    }
++
++    @Override
++    public void glUniform1f(int location, float x){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform1f(l, x);
++    }
++
++    @Override
++    public void glUniform1fv(int location, int count, FloatBuffer v){
++        uniformf("uniform1fv", location, count, 1, v);
++    }
++
++    @Override
++    public void glUniform1fv(int location, int count, float[] v, int offset){
++        uniformf("uniform1fv", location, count, 1, v, offset);
++    }
++
++    @Override
++    public void glUniform1i(int location, int x){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform1i(l, x);
++    }
++
++    @Override
++    public void glUniform1iv(int location, int count, IntBuffer v){
++        uniformi("uniform1iv", location, count, 1, v);
++    }
++
++    @Override
++    public void glUniform1iv(int location, int count, int[] v, int offset){
++        uniformi("uniform1iv", location, count, 1, v, offset);
++    }
++
++    @Override
++    public void glUniform2f(int location, float x, float y){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform2f(l, x, y);
++    }
++
++    @Override
++    public void glUniform2fv(int location, int count, FloatBuffer v){
++        uniformf("uniform2fv", location, count, 2, v);
++    }
++
++    @Override
++    public void glUniform2fv(int location, int count, float[] v, int offset){
++        uniformf("uniform2fv", location, count, 2, v, offset);
++    }
++
++    @Override
++    public void glUniform2i(int location, int x, int y){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform2i(l, x, y);
++    }
++
++    @Override
++    public void glUniform2iv(int location, int count, IntBuffer v){
++        uniformi("uniform2iv", location, count, 2, v);
++    }
++
++    @Override
++    public void glUniform2iv(int location, int count, int[] v, int offset){
++        uniformi("uniform2iv", location, count, 2, v, offset);
++    }
++
++    @Override
++    public void glUniform3f(int location, float x, float y, float z){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform3f(l, x, y, z);
++    }
++
++    @Override
++    public void glUniform3fv(int location, int count, FloatBuffer v){
++        uniformf("uniform3fv", location, count, 3, v);
++    }
++
++    @Override
++    public void glUniform3fv(int location, int count, float[] v, int offset){
++        uniformf("uniform3fv", location, count, 3, v, offset);
++    }
++
++    @Override
++    public void glUniform3i(int location, int x, int y, int z){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform3i(l, x, y, z);
++    }
++
++    @Override
++    public void glUniform3iv(int location, int count, IntBuffer v){
++        uniformi("uniform3iv", location, count, 3, v);
++    }
++
++    @Override
++    public void glUniform3iv(int location, int count, int[] v, int offset){
++        uniformi("uniform3iv", location, count, 3, v, offset);
++    }
++
++    @Override
++    public void glUniform4f(int location, float x, float y, float z, float w){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform4f(l, x, y, z, w);
++    }
++
++    @Override
++    public void glUniform4fv(int location, int count, FloatBuffer v){
++        uniformf("uniform4fv", location, count, 4, v);
++    }
++
++    @Override
++    public void glUniform4fv(int location, int count, float[] v, int offset){
++        uniformf("uniform4fv", location, count, 4, v, offset);
++    }
++
++    @Override
++    public void glUniform4i(int location, int x, int y, int z, int w){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) gl.uniform4i(l, x, y, z, w);
++    }
++
++    @Override
++    public void glUniform4iv(int location, int count, IntBuffer v){
++        uniformi("uniform4iv", location, count, 4, v);
++    }
++
++    @Override
++    public void glUniform4iv(int location, int count, int[] v, int offset){
++        uniformi("uniform4iv", location, count, 4, v, offset);
++    }
++
++    void matrix(String fn, int location, int count, int n, boolean transpose, FloatBuffer value){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) uniformMatrix(gl, fn, l, transpose, bytes(value, count * n * 4, 2));
++    }
++
++    void matrix(String fn, int location, int count, int n, boolean transpose, float[] value, int offset){
++        WebGLUniformLocation l = loc(location);
++        if(l != null) uniformMatrix(gl, fn, l, transpose, sub(value, offset, count * n));
++    }
++
++    @Override
++    public void glUniformMatrix2fv(int location, int count, boolean transpose, FloatBuffer value){
++        matrix("uniformMatrix2fv", location, count, 4, transpose, value);
++    }
++
++    @Override
++    public void glUniformMatrix2fv(int location, int count, boolean transpose, float[] value, int offset){
++        matrix("uniformMatrix2fv", location, count, 4, transpose, value, offset);
++    }
++
++    @Override
++    public void glUniformMatrix3fv(int location, int count, boolean transpose, FloatBuffer value){
++        matrix("uniformMatrix3fv", location, count, 9, transpose, value);
++    }
++
++    @Override
++    public void glUniformMatrix3fv(int location, int count, boolean transpose, float[] value, int offset){
++        matrix("uniformMatrix3fv", location, count, 9, transpose, value, offset);
++    }
++
++    @Override
++    public void glUniformMatrix4fv(int location, int count, boolean transpose, FloatBuffer value){
++        matrix("uniformMatrix4fv", location, count, 16, transpose, value);
++    }
++
++    @Override
++    public void glUniformMatrix4fv(int location, int count, boolean transpose, float[] value, int offset){
++        matrix("uniformMatrix4fv", location, count, 16, transpose, value, offset);
++    }
++
++    @Override
++    public void glUseProgram(int program){
++        gl.useProgram(get(program));
++    }
++
++    @Override
++    public void glValidateProgram(int program){
++        gl.validateProgram(get(program));
++    }
++
++    @Override
++    public void glVertexAttrib1f(int indx, float x){
++        gl.vertexAttrib1f(indx, x);
++    }
++
++    @Override
++    public void glVertexAttrib1fv(int indx, FloatBuffer values){
++        gl.vertexAttrib1f(indx, values.get(values.position()));
++    }
++
++    @Override
++    public void glVertexAttrib2f(int indx, float x, float y){
++        gl.vertexAttrib2f(indx, x, y);
++    }
++
++    @Override
++    public void glVertexAttrib2fv(int indx, FloatBuffer values){
++        int p = values.position();
++        gl.vertexAttrib2f(indx, values.get(p), values.get(p + 1));
++    }
++
++    @Override
++    public void glVertexAttrib3f(int indx, float x, float y, float z){
++        gl.vertexAttrib3f(indx, x, y, z);
++    }
++
++    @Override
++    public void glVertexAttrib3fv(int indx, FloatBuffer values){
++        int p = values.position();
++        gl.vertexAttrib3f(indx, values.get(p), values.get(p + 1), values.get(p + 2));
++    }
++
++    @Override
++    public void glVertexAttrib4f(int indx, float x, float y, float z, float w){
++        gl.vertexAttrib4f(indx, x, y, z, w);
++    }
++
++    @Override
++    public void glVertexAttrib4fv(int indx, FloatBuffer values){
++        int p = values.position();
++        gl.vertexAttrib4f(indx, values.get(p), values.get(p + 1), values.get(p + 2), values.get(p + 3));
++    }
++
++    @Override
++    public void glVertexAttribPointer(int indx, int size, int type, boolean normalized, int stride, Buffer ptr){
++        throw new UnsupportedOperationException("Client-side vertex arrays are not available in WebGL");
++    }
++
++    @Override
++    public void glVertexAttribPointer(int indx, int size, int type, boolean normalized, int stride, int ptr){
++        gl.vertexAttribPointer(indx, size, type, normalized, stride, ptr);
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebGraphics.java b/port/web/src/main/java/mindustry/web/WebGraphics.java
+new file mode 100644
+index 0000000..cf578d0
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebGraphics.java
+@@ -0,0 +1,276 @@
++package mindustry.web;
++
++import arc.*;
++import arc.graphics.*;
++import arc.graphics.Pixmap;
++import arc.Graphics.Cursor.*;
++import arc.graphics.gl.*;
++import arc.struct.*;
++import org.teavm.jso.*;
++import org.teavm.jso.dom.html.*;
++import org.teavm.jso.webgl.*;
++
++public class WebGraphics extends Graphics{
++    final HTMLCanvasElement canvas;
++    final WebGLRenderingContext context;
++    final WebGL20 gl20;
++    final GLVersion glVersion;
++    final BufferFormat bufferFormat = new BufferFormat(8, 8, 8, 8, 16, 8, 0, false);
++    final ObjectSet<String> extensions = new ObjectSet<>();
++
++    private double lastFrameTime = -1, frameCounterStart;
++    private float deltaTime;
++    private long frameId;
++    private int frames, fps;
++    int width, height, backWidth, backHeight;
++    float density = 1f;
++
++    WebGraphics(HTMLCanvasElement canvas){
++        this.canvas = canvas;
++        context = createContext(canvas);
++        if(context == null) throw new RuntimeException("WebGL 2 is not available.");
++
++        String[] ext = supportedExtensions(context);
++        for(String e : ext) extensions.add(e);
++        //needed for float textures used by the light/fog buffers
++        enableExtension(context, "EXT_color_buffer_float");
++        enableExtension(context, "EXT_color_buffer_half_float");
++        enableExtension(context, "OES_texture_float_linear");
++
++        Core.gl = Core.gl20 = gl20 = new WebGL20(context);
++        glVersion = new GLVersion(Application.ApplicationType.web, gl20.glGetString(GL20.GL_VERSION), gl20.glGetString(GL20.GL_VENDOR), gl20.glGetString(GL20.GL_RENDERER));
++    }
++
++    @JSBody(params = "canvas", script =
++        "var gl = canvas.getContext('webgl2', {alpha: false, antialias: false, depth: true, stencil: true, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance'});" +
++        "return gl || null;")
++    static native WebGLRenderingContext createContext(HTMLCanvasElement canvas);
++
++    @JSBody(params = "gl", script = "return gl.getSupportedExtensions() || [];")
++    static native String[] supportedExtensions(WebGLRenderingContext gl);
++
++    @JSBody(params = {"gl", "name"}, script = "return gl.getExtension(name) != null;")
++    static native boolean enableExtension(WebGLRenderingContext gl, String name);
++
++    @JSBody(params = "canvas", script = "return canvas.clientWidth | 0;")
++    static native int clientWidth(HTMLCanvasElement canvas);
++
++    @JSBody(params = "canvas", script = "return canvas.clientHeight | 0;")
++    static native int clientHeight(HTMLCanvasElement canvas);
++
++    @JSBody(script = "return window.devicePixelRatio || 1;")
++    static native double pixelRatio();
++
++    void update(){
++        double time = WebApplication.now();
++        if(lastFrameTime < 0) lastFrameTime = time;
++        deltaTime = (float)((time - lastFrameTime) / 1000.0);
++        //a hidden tab stops frames; don't let the game jump ahead when it comes back
++        if(deltaTime > 0.25f) deltaTime = 1f / 60f;
++        lastFrameTime = time;
++
++        if(time - frameCounterStart >= 1000){
++            fps = frames;
++            frames = 0;
++            frameCounterStart = time;
++        }
++        frames++;
++        frameId++;
++    }
++
++    /** @return whether the size changed. */
++    boolean updateSize(){
++        double ratio = pixelRatio();
++        int w = Math.max(clientWidth(canvas), 1), h = Math.max(clientHeight(canvas), 1);
++        int bw = (int)Math.round(w * ratio), bh = (int)Math.round(h * ratio);
++        if(bw == backWidth && bh == backHeight) return false;
++        backWidth = bw;
++        backHeight = bh;
++        //the game works in physical pixels, like the desktop build with HdpiMode.pixels
++        width = bw;
++        height = bh;
++        density = (float)ratio;
++        canvas.setWidth(bw);
++        canvas.setHeight(bh);
++        gl20.glViewport(0, 0, bw, bh);
++        return true;
++    }
++
++    @Override
++    public boolean isGL30Available(){
++        return false;
++    }
++
++    @Override
++    public GL20 getGL20(){
++        return gl20;
++    }
++
++    @Override
++    public void setGL20(GL20 gl20){
++        Core.gl = Core.gl20 = gl20;
++    }
++
++    @Override
++    public GL30 getGL30(){
++        return null;
++    }
++
++    @Override
++    public void setGL30(GL30 gl30){
++    }
++
++    @Override
++    public int getWidth(){
++        return width;
++    }
++
++    @Override
++    public int getHeight(){
++        return height;
++    }
++
++    @Override
++    public int getBackBufferWidth(){
++        return backWidth;
++    }
++
++    @Override
++    public int getBackBufferHeight(){
++        return backHeight;
++    }
++
++    @Override
++    public boolean isHidden(){
++        return WebHost.hidden();
++    }
++
++    @Override
++    public long getFrameId(){
++        return frameId;
++    }
++
++    @Override
++    public float getDeltaTime(){
++        return deltaTime;
++    }
++
++    @Override
++    public int getFramesPerSecond(){
++        return fps;
++    }
++
++    @Override
++    public GLVersion getGLVersion(){
++        return glVersion;
++    }
++
++    @Override
++    public float getPpiX(){
++        return 96 * density;
++    }
++
++    @Override
++    public float getPpiY(){
++        return 96 * density;
++    }
++
++    @Override
++    public float getPpcX(){
++        return 96 * density / 2.54f;
++    }
++
++    @Override
++    public float getPpcY(){
++        return 96 * density / 2.54f;
++    }
++
++    @Override
++    public float getDensity(){
++        return density;
++    }
++
++    @Override
++    public boolean setFullscreen(boolean fullscreen){
++        //the page's own button owns full screen
++        return false;
++    }
++
++    @Override
++    public boolean isFullscreen(){
++        return false;
++    }
++
++    @Override
++    public void setTitle(String title){
++    }
++
++    @Override
++    public void setVSync(boolean vsync){
++    }
++
++    @Override
++    public BufferFormat getBufferFormat(){
++        return bufferFormat;
++    }
++
++    @Override
++    public boolean supportsExtension(String extension){
++        return extensions.contains(extension);
++    }
++
++    @Override
++    public boolean isContinuousRendering(){
++        return true;
++    }
++
++    @Override
++    public void setContinuousRendering(boolean isContinuous){
++    }
++
++    @Override
++    public void requestRendering(){
++    }
++
++    @Override
++    public Cursor newCursor(Pixmap pixmap, int xHotspot, int yHotspot){
++        return new WebCursor(WebHost.cursorUrl(pixmap.pixels, pixmap.width, pixmap.height), xHotspot, yHotspot);
++    }
++
++    @Override
++    protected void setCursor(Cursor cursor){
++        WebCursor c = (WebCursor)cursor;
++        setCanvasCursor(canvas, "url(" + c.url + ") " + c.x + " " + c.y + ", auto");
++    }
++
++    @Override
++    protected void setSystemCursor(SystemCursor cursor){
++        String name = switch(cursor){
++            case arrow -> "default";
++            case ibeam -> "text";
++            case crosshair -> "crosshair";
++            case hand -> "pointer";
++            case horizontalResize -> "ew-resize";
++            case verticalResize -> "ns-resize";
++        };
++        setCanvasCursor(canvas, name);
++    }
++
++    @JSBody(params = {"canvas", "cursor"}, script = "canvas.style.cursor = cursor;")
++    static native void setCanvasCursor(HTMLCanvasElement canvas, String cursor);
++
++    static class WebCursor implements Cursor{
++        final String url;
++        final int x, y;
++
++        WebCursor(String url, int x, int y){
++            this.url = url;
++            this.x = x;
++            this.y = y;
++        }
++
++        @Override
++        public void dispose(){
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebHost.java b/port/web/src/main/java/mindustry/web/WebHost.java
+new file mode 100644
+index 0000000..fdeeefb
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebHost.java
+@@ -0,0 +1,70 @@
++package mindustry.web;
++
++import org.teavm.jso.*;
++import org.teavm.jso.dom.html.*;
++
++import java.io.*;
++import java.nio.*;
++
++/** Calls into the page's window.mindustryHost (mindustry-host.js). */
++public class WebHost{
++    static String clipboard = "";
++
++    @JSBody(script = "return window.mindustryHost.canvas;")
++    static native HTMLCanvasElement canvas();
++
++    @JSBody(script = "return document.hidden;")
++    static native boolean hidden();
++
++    @JSFunctor
++    interface VisibilityListener extends JSObject{
++        void changed(boolean visible);
++    }
++
++    @JSBody(params = "listener", script = "window.mindustryHost.onVisibility = listener;")
++    static native void onVisibility(VisibilityListener listener);
++
++    @JSBody(params = "text", script = "window.mindustryHost.writeClipboard(text);")
++    static native void writeClipboard(String text);
++
++    @JSBody(params = "uri", script = "window.mindustryHost.openURI(uri);")
++    static native void openURI(String uri);
++
++
++    @JSBody(script = "window.mindustryHost.exit();")
++    static native void exit();
++
++    @JSFunctor
++    interface Picked extends JSObject{
++        void picked(String name, org.teavm.jso.typedarrays.Int8Array data);
++    }
++
++    @JSBody(params = {"accept", "done"}, script = "window.mindustryHost.pickFile(accept, done);")
++    static native void pickFile(String accept, Picked done);
++
++    @JSBody(params = {"pixels", "w", "h"}, script = "return window.mindustryHost.cursorUrl(new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, w * h * 4), w, h);")
++    static native String cursorUrl(@JSBuffer(JSBufferType.UINT8) ByteBuffer pixels, int w, int h);
++
++    @JSBody(params = "message", script = "window.mindustryHost.crash(message);")
++    static native void crash(String message);
++
++    @JSBody(params = "message", script = "window.mindustryHost.log(message);")
++    static native void log(String message);
++
++    @JSBody(script = "window.mindustryHost.ready();")
++    static native void ready();
++
++    /** The JS stack of a Java exception; only readable in unobfuscated builds. */
++    @JSBody(params = "t", script = "var e = t.$jsException; return e && e.stack ? String(e.stack) : '';")
++    static native String jsStack(Throwable t);
++
++    static void crash(Throwable t){
++        StringWriter out = new StringWriter();
++        t.printStackTrace(new PrintWriter(out));
++        for(Throwable c = t; c != null; c = c.getCause()){
++            String stack = jsStack(c);
++            if(!stack.isEmpty()) out.append("\n--- ").append(String.valueOf(c)).append("\n").append(stack);
++        }
++        crash(out.toString());
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebInput.java b/port/web/src/main/java/mindustry/web/WebInput.java
+new file mode 100644
+index 0000000..432bfd1
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebInput.java
+@@ -0,0 +1,331 @@
++package mindustry.web;
++
++import arc.*;
++import arc.input.*;
++import arc.scene.ui.*;
++import org.teavm.jso.*;
++import org.teavm.jso.core.*;
++import org.teavm.jso.dom.html.*;
++
++import java.util.*;
++
++/**
++ * Keyboard, mouse, wheel and touch. The page's host script records DOM events into a queue
++ * (see mindustry-host.js); they are drained here once per frame.
++ */
++public class WebInput extends Input{
++    static final int maxPointers = 10;
++    static final HashMap<String, KeyCode> codes = new HashMap<>();
++
++    final InputEventQueue queue = new InputEventQueue();
++    final WebGraphics graphics;
++    final int[] x = new int[maxPointers], y = new int[maxPointers], dx = new int[maxPointers], dy = new int[maxPointers];
++    final boolean[] touched = new boolean[maxPointers];
++    final int[] touchIds = new int[maxPointers];
++    int mouseButtons;
++    boolean wantsText;
++
++    WebInput(HTMLCanvasElement canvas, WebGraphics graphics){
++        this.graphics = graphics;
++        Arrays.fill(touchIds, -1);
++    }
++
++    interface Event extends JSObject{
++        @JSProperty
++        String getT();
++        @JSProperty
++        String getCode();
++        @JSProperty
++        String getKey();
++        @JSProperty
++        double getX();
++        @JSProperty
++        double getY();
++        @JSProperty
++        int getB();
++        @JSProperty
++        int getId();
++        @JSProperty
++        boolean isRepeat();
++    }
++
++    @JSBody(script = "return window.mindustryHost.events.splice(0);")
++    static native JSArray<Event> poll();
++
++    @JSBody(params = "on", script = "window.mindustryHost.textInput(on);")
++    static native void textInput(boolean on);
++
++    int sx(double v){
++        return (int)Math.round(v * graphics.density);
++    }
++
++    int sy(double v){
++        return graphics.height - 1 - (int)Math.round(v * graphics.density);
++    }
++
++    int pointerFor(int id, boolean create){
++        for(int i = 0; i < maxPointers; i++) if(touchIds[i] == id) return i;
++        if(!create) return -1;
++        for(int i = 0; i < maxPointers; i++){
++            if(touchIds[i] == -1){
++                touchIds[i] = id;
++                return i;
++            }
++        }
++        return -1;
++    }
++
++    void update(){
++        JSArray<Event> events = poll();
++        for(int i = 0; i < events.getLength(); i++){
++            handle(events.get(i));
++        }
++        queue.setProcessor(inputMultiplexer);
++        queue.drain();
++
++        boolean text = Core.scene != null && Core.scene.getKeyboardFocus() instanceof TextField;
++        if(text != wantsText){
++            wantsText = text;
++            textInput(text);
++        }
++    }
++
++    void handle(Event e){
++        switch(e.getT()){
++            case "kd": {
++                KeyCode key = key(e.getCode());
++                if(!e.isRepeat()) queue.keyDown(key);
++                if(key == KeyCode.backspace) queue.keyTyped((char)8);
++                else if(key == KeyCode.tab) queue.keyTyped('\t');
++                else if(key == KeyCode.enter) queue.keyTyped((char)13);
++                else if(key == KeyCode.forwardDel || key == KeyCode.del) queue.keyTyped((char)127);
++                break;
++            }
++            case "ku":
++                queue.keyUp(key(e.getCode()));
++                break;
++            case "ch": {
++                String s = e.getKey();
++                for(int i = 0; i < s.length(); i++) queue.keyTyped(s.charAt(i));
++                break;
++            }
++            case "md": {
++                KeyCode button = button(e.getB());
++                move(0, e.getX(), e.getY());
++                mouseButtons++;
++                touched[0] = true;
++                queue.touchDown(x[0], y[0], 0, button);
++                break;
++            }
++            case "mu": {
++                KeyCode button = button(e.getB());
++                move(0, e.getX(), e.getY());
++                mouseButtons = Math.max(0, mouseButtons - 1);
++                touched[0] = mouseButtons > 0;
++                queue.touchUp(x[0], y[0], 0, button);
++                break;
++            }
++            case "mm":
++                move(0, e.getX(), e.getY());
++                if(mouseButtons > 0){
++                    queue.touchDragged(x[0], y[0], 0);
++                }else{
++                    queue.mouseMoved(x[0], y[0]);
++                }
++                break;
++            case "wh":
++                queue.scrolled((float)e.getX(), (float)e.getY());
++                break;
++            case "td": {
++                int p = pointerFor(e.getId(), true);
++                if(p < 0) break;
++                x[p] = sx(e.getX());
++                y[p] = sy(e.getY());
++                dx[p] = dy[p] = 0;
++                touched[p] = true;
++                queue.touchDown(x[p], y[p], p, KeyCode.mouseLeft);
++                break;
++            }
++            case "tm": {
++                int p = pointerFor(e.getId(), false);
++                if(p < 0) break;
++                move(p, e.getX(), e.getY());
++                queue.touchDragged(x[p], y[p], p);
++                break;
++            }
++            case "tu": {
++                int p = pointerFor(e.getId(), false);
++                if(p < 0) break;
++                move(p, e.getX(), e.getY());
++                touched[p] = false;
++                touchIds[p] = -1;
++                queue.touchUp(x[p], y[p], p, KeyCode.mouseLeft);
++                break;
++            }
++            case "blur":
++                //keys held while the page lost focus would otherwise stay down
++                keyboard.postUpdate();
++                for(KeyCode k : KeyCode.all){
++                    if(keyboard.isPressed(k)) queue.keyUp(k);
++                }
++                break;
++        }
++    }
++
++    void move(int p, double px, double py){
++        int nx = sx(px), ny = sy(py);
++        dx[p] = nx - x[p];
++        dy[p] = ny - y[p];
++        x[p] = nx;
++        y[p] = ny;
++    }
++
++    static KeyCode button(int b){
++        switch(b){
++            case 1: return KeyCode.mouseMiddle;
++            case 2: return KeyCode.mouseRight;
++            case 3: return KeyCode.mouseBack;
++            case 4: return KeyCode.mouseForward;
++            default: return KeyCode.mouseLeft;
++        }
++    }
++
++    static KeyCode key(String code){
++        KeyCode key = codes.get(code);
++        return key == null ? KeyCode.unknown : key;
++    }
++
++    void postUpdate(){
++        keyboard.postUpdate();
++        Arrays.fill(dx, 0);
++        Arrays.fill(dy, 0);
++    }
++
++    @Override
++    public int mouseX(){
++        return x[0];
++    }
++
++    @Override
++    public int mouseX(int pointer){
++        return pointer >= 0 && pointer < maxPointers ? x[pointer] : 0;
++    }
++
++    @Override
++    public int deltaX(){
++        return dx[0];
++    }
++
++    @Override
++    public int deltaX(int pointer){
++        return pointer >= 0 && pointer < maxPointers ? dx[pointer] : 0;
++    }
++
++    @Override
++    public int mouseY(){
++        return y[0];
++    }
++
++    @Override
++    public int mouseY(int pointer){
++        return pointer >= 0 && pointer < maxPointers ? y[pointer] : 0;
++    }
++
++    @Override
++    public int deltaY(){
++        return dy[0];
++    }
++
++    @Override
++    public int deltaY(int pointer){
++        return pointer >= 0 && pointer < maxPointers ? dy[pointer] : 0;
++    }
++
++    @Override
++    public boolean isTouched(){
++        for(boolean t : touched) if(t) return true;
++        return false;
++    }
++
++    @Override
++    public boolean justTouched(){
++        return keyTap(KeyCode.mouseLeft) || keyTap(KeyCode.mouseRight);
++    }
++
++    @Override
++    public boolean isTouched(int pointer){
++        return pointer >= 0 && pointer < maxPointers && touched[pointer];
++    }
++
++    @Override
++    public int getTouches(){
++        int n = 0;
++        for(boolean t : touched) if(t) n++;
++        return n;
++    }
++
++    @Override
++    public long getCurrentEventTime(){
++        return queue.getCurrentEventTime();
++    }
++
++    static void map(String code, KeyCode key){
++        codes.put(code, key);
++    }
++
++    static{
++        for(char c = 'A'; c <= 'Z'; c++) map("Key" + c, KeyCode.valueOf(String.valueOf(Character.toLowerCase(c))));
++        for(int i = 0; i <= 9; i++){
++            map("Digit" + i, KeyCode.valueOf("num" + i));
++            map("Numpad" + i, KeyCode.valueOf("num" + i));
++        }
++        for(int i = 1; i <= 12; i++) map("F" + i, KeyCode.valueOf("f" + i));
++        map("Backspace", KeyCode.backspace);
++        map("Tab", KeyCode.tab);
++        map("Enter", KeyCode.enter);
++        map("NumpadEnter", KeyCode.enter);
++        map("Escape", KeyCode.escape);
++        map("Space", KeyCode.space);
++        map("NumpadAdd", KeyCode.plus);
++        map("Comma", KeyCode.comma);
++        map("NumpadComma", KeyCode.comma);
++        map("Minus", KeyCode.minus);
++        map("NumpadSubtract", KeyCode.minus);
++        map("Period", KeyCode.period);
++        map("NumpadDecimal", KeyCode.period);
++        map("Slash", KeyCode.slash);
++        map("NumpadDivide", KeyCode.slash);
++        map("NumpadMultiply", KeyCode.asterisk);
++        map("Semicolon", KeyCode.semicolon);
++        map("Quote", KeyCode.apostrophe);
++        map("Equal", KeyCode.equals);
++        map("BracketLeft", KeyCode.leftBracket);
++        map("BracketRight", KeyCode.rightBracket);
++        map("Backslash", KeyCode.backslash);
++        map("IntlBackslash", KeyCode.backslash);
++        map("Backquote", KeyCode.backtick);
++        map("MetaLeft", KeyCode.sym);
++        map("MetaRight", KeyCode.sym);
++        map("ControlLeft", KeyCode.controlLeft);
++        map("ControlRight", KeyCode.controlRight);
++        map("ShiftLeft", KeyCode.shiftLeft);
++        map("ShiftRight", KeyCode.shiftRight);
++        map("AltLeft", KeyCode.altLeft);
++        map("AltRight", KeyCode.altRight);
++        map("CapsLock", KeyCode.capsLock);
++        map("PrintScreen", KeyCode.printScreen);
++        map("ScrollLock", KeyCode.scrollLock);
++        map("Pause", KeyCode.pause);
++        map("Insert", KeyCode.insert);
++        map("Delete", KeyCode.del);
++        map("Home", KeyCode.home);
++        map("End", KeyCode.end);
++        map("PageUp", KeyCode.pageUp);
++        map("PageDown", KeyCode.pageDown);
++        map("ArrowRight", KeyCode.right);
++        map("ArrowLeft", KeyCode.left);
++        map("ArrowDown", KeyCode.down);
++        map("ArrowUp", KeyCode.up);
++        map("ContextMenu", KeyCode.menu);
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebLauncher.java b/port/web/src/main/java/mindustry/web/WebLauncher.java
+new file mode 100644
+index 0000000..ebf22e5
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebLauncher.java
+@@ -0,0 +1,108 @@
++package mindustry.web;
++
++import arc.*;
++import arc.util.*;
++import mindustry.*;
++import mindustry.net.*;
++import mindustry.net.Net.*;
++
++public class WebLauncher extends ClientLauncher{
++    static WebFileSystem fs;
++    static WebStorage storage;
++
++    public static void main(String[] args){
++        //read by arc.util.OS; there is no user account or home folder here
++        System.setProperty("user.name", "player");
++        System.setProperty("user.home", WebFileSystem.dataRoot);
++        System.setProperty("java.home", "/java");
++        fs = WebFileSystem.install();
++        storage = new WebStorage(fs);
++        storage.mount();
++
++        mindustry.world.Block.webBuildTypes = WebBuildTypes::get;
++        //touch screens get the game's touch controls and layout
++        Vars.testMobile = touchScreen();
++        WebMusic.install();
++        Log.logger = (level, text) -> WebHost.log("[" + level.name() + "] " + Log.removeColors(text));
++
++        //building the app opens WebGL 2, which can fail before run() reports errors itself
++        WebApplication app;
++        try{
++            app = new WebApplication(new WebLauncher());
++        }catch(Throwable t){
++            WebHost.crash(t);
++            return;
++        }
++        app.run();
++    }
++
++    @Override
++    public void setup(){
++        Core.settings.setDataDirectory(Core.files.absolute(WebFileSystem.dataRoot));
++        super.setup();
++    }
++
++    @org.teavm.jso.JSBody(script = "return matchMedia('(pointer: coarse)').matches;")
++    static native boolean touchScreen();
++
++    /** Saving gives a file that becomes a download; opening asks the browser for one. */
++    @Override
++    public void showFileChooser(mindustry.ui.FileChooser.FileChooserParams params){
++        if(!params.open){
++            arc.files.Fi dir = Core.files.absolute(WebFileSystem.downloadRoot);
++            dir.mkdirs();
++            params.handleChooseResult(dir.child(params.fileName));
++            return;
++        }
++        WebHost.pickFile("." + String.join(",.", params.extensions), (name, data) -> Core.app.post(() -> {
++            arc.files.Fi file = Core.files.absolute("/uploads").child(name);
++            file.writeBytes(data.toJavaArray());
++            params.handleChooseResult(file);
++        }));
++    }
++
++    @Override
++    public NetProvider getNet(){
++        return new OfflineNet();
++    }
++
++    /** No sockets in a browser: hosting and joining games are unavailable. */
++    static class OfflineNet implements NetProvider{
++        @Override
++        public void connectClient(String ip, int port, Runnable success){
++            Vars.net.showError(new RuntimeException("Multiplayer is not available in the browser."));
++        }
++
++        @Override
++        public void sendClient(Object object, boolean reliable){
++        }
++
++        @Override
++        public void disconnectClient(){
++        }
++
++        @Override
++        public void discoverServers(arc.func.Cons<Host> callback, Runnable done){
++            done.run();
++        }
++
++        @Override
++        public void pingHost(String address, int port, arc.func.Cons<Host> valid, arc.func.Cons<Exception> failed){
++            failed.get(new RuntimeException("Multiplayer is not available in the browser."));
++        }
++
++        @Override
++        public void hostServer(int port){
++            throw new RuntimeException("Multiplayer is not available in the browser.");
++        }
++
++        @Override
++        public Iterable<? extends NetConnection> getConnections(){
++            return new arc.struct.Seq<>();
++        }
++
++        @Override
++        public void closeServer(){
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebMusic.java b/port/web/src/main/java/mindustry/web/WebMusic.java
+new file mode 100644
+index 0000000..4b285f9
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebMusic.java
+@@ -0,0 +1,57 @@
++package mindustry.web;
++
++import arc.audio.*;
++import arc.files.*;
++import arc.struct.*;
++import arc.util.*;
++import org.teavm.jso.*;
++import org.teavm.jso.core.*;
++import org.teavm.jso.typedarrays.*;
++
++/** Music comes in after the game starts (the page downloads it); a track plays once its bytes are in. */
++public class WebMusic{
++    static final IntMap<Music> pending = new IntMap<>();
++    static int lastId;
++
++    interface Loaded extends JSObject{
++        @JSProperty
++        int getId();
++        @JSProperty
++        Int8Array getData();
++    }
++
++    @JSBody(params = {"id", "path"}, script = "window.mindustryHost.fetchLazy(id, path);")
++    static native void fetch(int id, String path);
++
++    @JSBody(script = "return window.mindustryHost.lazyLoaded.splice(0);")
++    static native JSArray<Loaded> poll();
++
++    static void install(){
++        Music.webLoader = (music, file) -> {
++            int id = ++lastId;
++            pending.put(id, music);
++            //internal files are named relative to the asset folder
++            fetch(id, file.path());
++        };
++    }
++
++    /** Called once per frame. */
++    static void update(){
++        if(pending.isEmpty()) return;
++        JSArray<Loaded> loaded = poll();
++        for(int i = 0; i < loaded.getLength(); i++){
++            Loaded l = loaded.get(i);
++            Music music = pending.remove(l.getId());
++            if(music == null) continue;
++            if(l.getData() == null){
++                Log.err("Could not load music: " + music.file);
++                continue;
++            }
++            try{
++                music.load(l.getData().toJavaArray());
++            }catch(Exception e){
++                Log.err("Could not load music: " + music.file, e);
++            }
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebPlugin.java b/port/web/src/main/java/mindustry/web/WebPlugin.java
+new file mode 100644
+index 0000000..065df02
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebPlugin.java
+@@ -0,0 +1,90 @@
++package mindustry.web;
++
++import org.teavm.model.*;
++import org.teavm.model.emit.*;
++import org.teavm.model.instructions.*;
++import org.teavm.vm.spi.*;
++
++import java.util.*;
++
++/**
++ * Compile-time redirects for JDK methods the browser class library lacks: each call is
++ * rewritten into a static call to {@link Shims}, with the receiver as the first argument.
++ */
++public class WebPlugin implements TeaVMPlugin{
++    static final Map<MethodReference, MethodReference> redirects = new HashMap<>();
++
++    static void redirect(String cls, String name, ValueType ret, ValueType... args){
++        boolean instance = !cls.startsWith("static:");
++        cls = cls.replace("static:", "");
++        ValueType[] shimArgs = args;
++        if(instance){
++            shimArgs = new ValueType[args.length + 1];
++            shimArgs[0] = ValueType.object(cls);
++            System.arraycopy(args, 0, shimArgs, 1, args.length);
++        }
++        ValueType[] from = Arrays.copyOf(args, args.length + 1);
++        from[args.length] = ret;
++        ValueType[] to = Arrays.copyOf(shimArgs, shimArgs.length + 1);
++        to[shimArgs.length] = ret;
++        redirects.put(new MethodReference(cls, name, from), new MethodReference(Shims.class.getName(), name, to));
++    }
++
++    static{
++        ValueType str = ValueType.object("java.lang.String");
++        redirect("java.lang.Class", "isAnonymousClass", ValueType.BOOLEAN);
++        redirect("java.lang.Class", "getResource", ValueType.object("java.net.URL"), str);
++        redirect("java.lang.Runtime", "maxMemory", ValueType.LONG);
++        redirect("arc.files.Fi", "map", ValueType.object("java.nio.ByteBuffer"));
++        redirect("static:java.lang.Thread", "sleep", ValueType.VOID, ValueType.LONG, ValueType.INTEGER);
++        redirect("static:arc.util.Strings", "getStackTrace", str, ValueType.object("java.lang.Throwable"));
++        redirect("java.lang.Throwable", "printStackTrace", ValueType.VOID, ValueType.object("java.io.PrintWriter"));
++    }
++
++    @Override
++    public void install(TeaVMHost host){
++        host.add((ClassHolderTransformer)(cls, context) -> {
++            if(cls.getName().equals(Shims.class.getName())) return;
++            //TeaVM's InflaterInputStream.skip() reads into the buffer that still holds compressed input,
++            //corrupting maps and saves whose chunks get skipped; route it through Shims.inflaterSkip
++            if(cls.getName().endsWith("InflaterInputStream") && (cls.getName().startsWith("java.util.zip.") || cls.getName().startsWith("org.teavm.classlib.java.util.zip."))){
++                MethodHolder skip = cls.getMethod(new MethodDescriptor("skip", ValueType.LONG, ValueType.LONG));
++                if(skip != null){
++                    ProgramEmitter pe = ProgramEmitter.create(skip, context.getHierarchy());
++                    pe.invoke(Shims.class.getName(), "inflaterSkip", ValueType.LONG,
++                        pe.var(0, ValueType.object("java.io.InputStream")), pe.var(1, ValueType.LONG)).returnValue();
++                    System.out.println("[WebPlugin] patched " + cls.getName() + ".skip");
++                }
++            }
++            for(MethodHolder method : cls.getMethods()){
++                //Arc natives with no browser version (Pixmap's stb_image path, env vars) are never taken
++                //here, since ArcNativesLoader.loaded stays false; give them a body that throws
++                if(cls.getName().startsWith("arc.") && method.hasModifier(ElementModifier.NATIVE)
++                    && !method.getName().contains("$js_body$") && method.getAnnotations().get("org.teavm.jso.JSBody") == null){
++                    method.getModifiers().remove(ElementModifier.NATIVE);
++                    ProgramEmitter pe = ProgramEmitter.create(method, context.getHierarchy());
++                    pe.construct(UnsupportedOperationException.class, pe.constant(method.getReference().toString())).raise();
++                    continue;
++                }
++                Program program = method.getProgram();
++                if(program == null) continue;
++                for(BasicBlock block : program.getBasicBlocks()){
++                    for(Instruction insn : block){
++                        if(!(insn instanceof InvokeInstruction invoke)) continue;
++                        MethodReference target = redirects.get(invoke.getMethod());
++                        if(target == null) continue;
++                        if(invoke.getInstance() != null){
++                            List<Variable> args = new ArrayList<>();
++                            args.add(invoke.getInstance());
++                            args.addAll(invoke.getArguments());
++                            invoke.setInstance(null);
++                            invoke.setArguments(args.toArray(new Variable[0]));
++                        }
++                        invoke.setType(InvocationType.SPECIAL);
++                        invoke.setMethod(target);
++                    }
++                }
++            }
++        });
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebReflection.java b/port/web/src/main/java/mindustry/web/WebReflection.java
+new file mode 100644
+index 0000000..ae1cbfd
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebReflection.java
+@@ -0,0 +1,79 @@
++package mindustry.web;
++
++import org.teavm.extension.introspect.*;
++import org.teavm.extension.spi.reflection.*;
++
++import java.lang.reflect.*;
++import java.util.*;
++
++/**
++ * Arc's Json reads and writes fields by reflection (rules, objectives, settings, planet data) and creates
++ * objects with no-arg constructors. Opening every class makes the build run out of memory, so only the
++ * classes Json can reach from what Mindustry serializes get their fields and constructors.
++ */
++public class WebReflection extends SimpleReflectionPolicy{
++    //whole packages holding serialized types, polymorphic ones included (objectives, markers)
++    static final List<String> packages = List.of("mindustry.game.", "mindustry.maps.", "mindustry.io.", "mindustry.mod.", "mindustry.net.");
++    //classes passed to Json in Mindustry's code and settings
++    static final List<String> roots = List.of("mindustry.game.Rules", "mindustry.type.ItemStack", "mindustry.type.LiquidStack",
++        "mindustry.type.PayloadStack", "mindustry.type.ItemSeq", "mindustry.type.Planet$PlanetData", "mindustry.game.SectorInfo",
++        "mindustry.game.CampaignRules", "mindustry.game.GameStats", "mindustry.world.consumers.ConsumeLiquid",
++        "mindustry.mod.Mods$ModMeta", "mindustry.type.MapLocales", "mindustry.audio.MusicContainer",
++        "mindustry.ui.dialogs.MapListDialog$MapViewSettings", "mindustry.ui.dialogs.JoinDialog$Server",
++        "arc.graphics.Color", "arc.math.geom.Vec2", "arc.math.geom.Point2", "arc.math.geom.Rect",
++        "arc.struct.Seq", "arc.struct.IntSeq", "arc.struct.IntMap", "arc.struct.ObjectMap", "arc.struct.ObjectIntMap",
++        "arc.struct.ObjectFloatMap", "arc.struct.ObjectSet", "arc.struct.IntSet", "arc.struct.StringMap", "arc.struct.OrderedMap",
++        "arc.struct.OrderedSet", "arc.struct.ArrayMap", "arc.struct.Queue");
++
++    final Set<String> open = new HashSet<>();
++
++    @Override
++    protected void setup(){
++        IntrospectClass<?> content = environment().findClass("mindustry.ctype.Content");
++        ArrayDeque<IntrospectClass<?>> queue = new ArrayDeque<>();
++        for(String root : roots) queue.add(environment().findClass(root));
++        while(!queue.isEmpty()){
++            IntrospectClass<?> cls = queue.poll();
++            if(cls == null || cls.isPrimitive()) continue;
++            if(cls.isArray()){
++                queue.add(cls.componentType());
++                continue;
++            }
++            String name = cls.name();
++            //content is written by name through custom serializers
++            if(!(name.startsWith("mindustry.") || name.startsWith("arc.")) || content.isAssignableFrom(cls) || !open.add(name)) continue;
++            queue.add(cls.superclass());
++            for(IntrospectField field : cls.declaredFields()){
++                if(!serializable(field)) continue;
++                queue.add(field.type());
++                addTypes(field.genericType(), queue);
++            }
++        }
++
++        System.out.println("[WebReflection] " + open.size() + " classes from roots: " + new TreeSet<>(open));
++        selectClasses(c -> open.contains(c.name()) || packages.stream().anyMatch(p -> c.name().startsWith(p)))
++            .reflectableFields(WebReflection::serializable)
++            .reflectableMethods(m -> m.isConstructor() && m.parameters().isEmpty());
++        //listed with getFields(): UI styles, logic layers, effects
++        selectClasses(c -> statics.contains(c.name())).reflectableFields(f -> Modifier.isStatic(f.modifiers()) && Modifier.isPublic(f.modifiers()));
++    }
++
++    static final List<String> statics = List.of("mindustry.ui.Styles", "mindustry.graphics.Layer", "mindustry.content.Fx");
++
++    static boolean serializable(IntrospectField f){
++        return !Modifier.isStatic(f.modifiers()) && !Modifier.isTransient(f.modifiers());
++    }
++
++    static void addTypes(IntrospectType type, Deque<IntrospectClass<?>> queue){
++        if(type instanceof IntrospectClass<?> c){
++            queue.add(c);
++        }else if(type instanceof IntrospectParameterizedType p){
++            queue.add(p.rawType());
++            for(IntrospectTypeArgument arg : p.typeArguments()){
++                if(arg.type() != null) addTypes(arg.type(), queue);
++            }
++        }else if(type instanceof IntrospectGenericArray a){
++            addTypes(a.componentType(), queue);
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebStorage.java b/port/web/src/main/java/mindustry/web/WebStorage.java
+new file mode 100644
+index 0000000..c88bf40
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebStorage.java
+@@ -0,0 +1,82 @@
++package mindustry.web;
++
++import org.teavm.jso.*;
++import org.teavm.jso.core.*;
++import org.teavm.jso.typedarrays.*;
++
++/** Mounts the asset bundle and the player's saved files, and writes changed files back to IndexedDB. */
++public class WebStorage{
++    final WebFileSystem fs;
++    double lastFlush;
++
++    WebStorage(WebFileSystem fs){
++        this.fs = fs;
++    }
++
++    interface Entry extends JSObject{
++        @JSProperty
++        String getPath();
++        @JSProperty
++        Int8Array getData();
++        @JSProperty
++        double getModified();
++    }
++
++    @JSBody(script = "var a = window.mindustryHost.assets; window.mindustryHost.assets = null; return a;")
++    static native JSArray<Entry> takeAssets();
++
++    @JSBody(script = "var a = window.mindustryHost.saved; window.mindustryHost.saved = null; return a || [];")
++    static native JSArray<Entry> takeSaved();
++
++    @JSBody(params = {"path", "data", "length", "modified"}, script = "window.mindustryHost.store(path, data.subarray(0, length), modified);")
++    static native void store(String path, @JSByRef byte[] data, int length, double modified);
++
++    @JSBody(params = {"name", "data", "length"}, script = "window.mindustryHost.download(name, data.subarray(0, length));")
++    static native void download(String name, @JSByRef byte[] data, int length);
++
++    @JSBody(params = "path", script = "window.mindustryHost.remove(path);")
++    static native void remove(String path);
++
++    void mount(){
++        JSArray<Entry> assets = takeAssets();
++        for(int i = 0; i < assets.getLength(); i++){
++            Entry e = assets.get(i);
++            byte[] data = e.getData().toJavaArray();
++            fs.put(WebFiles.assetsPath + e.getPath(), data, data.length, 0, false);
++            fs.file(WebFiles.assetsPath + e.getPath()).readOnly = true;
++        }
++        JSArray<Entry> saved = takeSaved();
++        for(int i = 0; i < saved.getLength(); i++){
++            Entry e = saved.get(i);
++            byte[] data = e.getData().toJavaArray();
++            fs.put(e.getPath(), data, data.length, (long)e.getModified(), false);
++        }
++        fs.mkdirs(WebFileSystem.dataRoot);
++    }
++
++    void tick(){
++        double now = WebApplication.now();
++        if(now - lastFlush > 2000){
++            flush();
++        }
++    }
++
++    void flush(){
++        lastFlush = WebApplication.now();
++        if(fs.dirty.isEmpty()) return;
++        for(String path : fs.takeDirty()){
++            WebFileSystem.FileNode node = fs.file(path);
++            if(path.startsWith(WebFileSystem.downloadRoot + "/")){
++                //written in full by now: exports run within one frame
++                if(node != null){
++                    download(path.substring(path.lastIndexOf('/') + 1), node.data, node.size);
++                    arc.Core.files.absolute(path).delete();
++                }
++            }else if(node != null){
++                store(path, node.data, node.size, node.modified);
++            }else if(fs.find(path) == null){
++                remove(path);
++            }
++        }
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/WebSubstitutions.java b/port/web/src/main/java/mindustry/web/WebSubstitutions.java
+new file mode 100644
+index 0000000..b8600a0
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/WebSubstitutions.java
+@@ -0,0 +1,21 @@
++package mindustry.web;
++
++import org.teavm.extension.spi.substitution.*;
++
++/** Swaps in browser stand-ins for JDK internals that Arc and Mindustry reference. */
++public class WebSubstitutions extends SimpleSubstitutionPolicy{
++    @Override
++    public void contribute(SubstitutionSink sink){
++        sink.selectClasses(named("sun.misc.Unsafe")).replacePackage("sun.misc", "mindustry.web.emu");
++        sink.selectClasses(named("mindustry.net.ArcNetProvider").or(named("mindustry.net.BeControl")))
++            .replacePackage("mindustry.net", "mindustry.web.emu");
++        sink.selectClasses(named("mindustry.mod.ModClassLoader").or(named("mindustry.mod.Scripts")))
++            .replacePackage("mindustry.mod", "mindustry.web.emu");
++        sink.selectClasses(named("mindustry.core.Platform$1")).replacePackage("mindustry.core", "mindustry.web.emu");
++        //natives: Buffers on typed arrays, FreeType and SoLoud through arc-natives.wasm
++        sink.selectClasses(named("arc.util.Buffers")).replacePackage("arc.util", "mindustry.web.emu");
++        sink.selectClasses(named("arc.audio.Soloud")).replacePackage("arc.audio", "mindustry.web.emu");
++        sink.selectClasses(namePattern("arc.freetype.FreeType").or(namePattern("arc.freetype.FreeType$*")))
++            .replacePackage("arc.freetype", "mindustry.web.emu");
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/ArcNetProvider.java b/port/web/src/main/java/mindustry/web/emu/ArcNetProvider.java
+new file mode 100644
+index 0000000..465ed4c
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/ArcNetProvider.java
+@@ -0,0 +1,50 @@
++package mindustry.web.emu;
++
++import arc.func.*;
++import mindustry.*;
++import mindustry.net.*;
++import mindustry.net.Net.*;
++
++/** Stands in for mindustry.net.ArcNetProvider: browsers have no sockets, so there is no multiplayer. */
++public class ArcNetProvider implements NetProvider{
++    static RuntimeException unavailable(){
++        return new RuntimeException("Multiplayer is not available in the browser.");
++    }
++
++    @Override
++    public void connectClient(String ip, int port, Runnable success){
++        Vars.net.showError(unavailable());
++    }
++
++    @Override
++    public void sendClient(Object object, boolean reliable){
++    }
++
++    @Override
++    public void disconnectClient(){
++    }
++
++    @Override
++    public void discoverServers(Cons<Host> callback, Runnable done){
++        done.run();
++    }
++
++    @Override
++    public void pingHost(String address, int port, Cons<Host> valid, Cons<Exception> failed){
++        failed.get(unavailable());
++    }
++
++    @Override
++    public void hostServer(int port){
++        throw unavailable();
++    }
++
++    @Override
++    public Iterable<? extends NetConnection> getConnections(){
++        return new arc.struct.Seq<>();
++    }
++
++    @Override
++    public void closeServer(){
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/BeControl.java b/port/web/src/main/java/mindustry/web/emu/BeControl.java
+new file mode 100644
+index 0000000..228374d
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/BeControl.java
+@@ -0,0 +1,24 @@
++package mindustry.web.emu;
++
++import arc.func.*;
++
++/** Stands in for mindustry.net.BeControl (desktop self-updates). */
++public class BeControl{
++    public boolean active(){
++        return false;
++    }
++
++    public void init(){
++    }
++
++    public void checkUpdate(Boolc done){
++        done.get(false);
++    }
++
++    public boolean isUpdateAvailable(){
++        return false;
++    }
++
++    public void showUpdateDialog(){
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/Buffers.java b/port/web/src/main/java/mindustry/web/emu/Buffers.java
+new file mode 100644
+index 0000000..718acf7
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/Buffers.java
+@@ -0,0 +1,181 @@
++package mindustry.web.emu;
++
++import arc.struct.*;
++import arc.util.*;
++import org.teavm.jso.*;
++
++import java.nio.*;
++
++/** Arc's Buffers with the JNI copies done on typed arrays. Direct buffers are plain JS memory here. */
++public final class Buffers{
++    static final Seq<ByteBuffer> unsafeBuffers = new Seq<>();
++    static int allocatedUnsafe = 0;
++
++    public static void copy(float[] src, Buffer dst, int numFloats, int offset){
++        if(dst instanceof ByteBuffer)
++            dst.limit(numFloats << 2);
++        else if(dst instanceof FloatBuffer) dst.limit(numFloats);
++
++        copyJni(src, dst, numFloats, offset);
++        dst.position(0);
++    }
++
++    public static void copy(byte[] src, int srcOffset, Buffer dst, int numElements){
++        dst.limit(dst.position() + bytesToElements(dst, numElements));
++        copyJni(src, srcOffset, dst, positionInBytes(dst), numElements);
++    }
++
++    public static void copy(short[] src, int srcOffset, Buffer dst, int numElements){
++        dst.limit(dst.position() + bytesToElements(dst, numElements << 1));
++        copyJni(src, srcOffset, dst, positionInBytes(dst), numElements << 1);
++    }
++
++    public static void copy(float[] src, int srcOffset, int numElements, Buffer dst){
++        copyJni(src, srcOffset, dst, positionInBytes(dst), numElements << 2);
++    }
++
++    public static void copy(int[] src, int srcOffset, Buffer dst, int numElements){
++        dst.limit(dst.position() + bytesToElements(dst, numElements << 2));
++        copyJni(src, srcOffset, dst, positionInBytes(dst), numElements << 2);
++    }
++
++    public static void copy(float[] src, int srcOffset, Buffer dst, int numElements){
++        dst.limit(dst.position() + bytesToElements(dst, numElements << 2));
++        copyJni(src, srcOffset, dst, positionInBytes(dst), numElements << 2);
++    }
++
++    public static void copy(Buffer src, Buffer dst, int numElements){
++        int numBytes = elementsToBytes(src, numElements);
++        dst.limit(dst.position() + bytesToElements(dst, numBytes));
++        copyJni(src, positionInBytes(src), dst, positionInBytes(dst), numBytes);
++    }
++
++    private static int positionInBytes(Buffer dst){
++        return dst.position() << elementShift(dst);
++    }
++
++    private static int bytesToElements(Buffer dst, int bytes){
++        return bytes >>> elementShift(dst);
++    }
++
++    private static int elementsToBytes(Buffer dst, int elements){
++        return elements << elementShift(dst);
++    }
++
++    private static int elementShift(Buffer dst){
++        if(dst instanceof ByteBuffer)
++            return 0;
++        else if(dst instanceof ShortBuffer || dst instanceof CharBuffer)
++            return 1;
++        else if(dst instanceof IntBuffer)
++            return 2;
++        else if(dst instanceof LongBuffer)
++            return 3;
++        else if(dst instanceof FloatBuffer)
++            return 2;
++        else if(dst instanceof DoubleBuffer)
++            return 3;
++        else
++            throw new ArcRuntimeException("Can't copy to a " + dst.getClass().getName() + " instance");
++    }
++
++    public static FloatBuffer newFloatBuffer(int numFloats){
++        ByteBuffer buffer = ByteBuffer.allocateDirect(numFloats * 4);
++        buffer.order(ByteOrder.nativeOrder());
++        return buffer.asFloatBuffer();
++    }
++
++    public static ShortBuffer newShortBuffer(int numShorts){
++        ByteBuffer buffer = ByteBuffer.allocateDirect(numShorts * 2);
++        buffer.order(ByteOrder.nativeOrder());
++        return buffer.asShortBuffer();
++    }
++
++    public static ByteBuffer newByteBuffer(int numBytes){
++        ByteBuffer buffer = ByteBuffer.allocateDirect(numBytes);
++        buffer.order(ByteOrder.nativeOrder());
++        return buffer;
++    }
++
++    public static IntBuffer newIntBuffer(int numInts){
++        ByteBuffer buffer = ByteBuffer.allocateDirect(numInts * 4);
++        buffer.order(ByteOrder.nativeOrder());
++        return buffer.asIntBuffer();
++    }
++
++    public static void disposeUnsafeByteBuffer(ByteBuffer buffer){
++        int size = buffer.capacity();
++        if(!unsafeBuffers.remove(buffer, true))
++            throw new IllegalArgumentException("buffer not allocated with newUnsafeByteBuffer or already disposed");
++        allocatedUnsafe -= size;
++    }
++
++    public static boolean isUnsafeByteBuffer(ByteBuffer buffer){
++        return unsafeBuffers.contains(buffer, true);
++    }
++
++    public static ByteBuffer newUnsafeByteBuffer(int numBytes){
++        ByteBuffer buffer = newByteBuffer(numBytes);
++        allocatedUnsafe += numBytes;
++        unsafeBuffers.add(buffer);
++        return buffer;
++    }
++
++    public static long getUnsafeBufferAddress(Buffer buffer){
++        return 0;
++    }
++
++    public static ByteBuffer newUnsafeByteBuffer(ByteBuffer buffer){
++        allocatedUnsafe += buffer.capacity();
++        unsafeBuffers.add(buffer);
++        return buffer;
++    }
++
++    public static int getAllocatedBytesUnsafe(){
++        return allocatedUnsafe;
++    }
++
++    private static void copyJni(float[] src, Buffer dst, int numFloats, int offset){
++        copyArray(src, offset * 4, dst, 0, numFloats << 2);
++    }
++
++    private static void copyJni(byte[] src, int srcOffset, Buffer dst, int dstOffset, int numBytes){
++        copyArray(src, srcOffset, dst, dstOffset, numBytes);
++    }
++
++    private static void copyJni(short[] src, int srcOffset, Buffer dst, int dstOffset, int numBytes){
++        copyArray(src, srcOffset * 2, dst, dstOffset, numBytes);
++    }
++
++    private static void copyJni(int[] src, int srcOffset, Buffer dst, int dstOffset, int numBytes){
++        copyArray(src, srcOffset * 4, dst, dstOffset, numBytes);
++    }
++
++    private static void copyJni(float[] src, int srcOffset, Buffer dst, int dstOffset, int numBytes){
++        copyArray(src, srcOffset * 4, dst, dstOffset, numBytes);
++    }
++
++    public static void copyJni(Buffer src, int srcOffset, Buffer dst, int dstOffset, int numBytes){
++        copyBuffer(src, srcOffset, dst, dstOffset, numBytes);
++    }
++
++    @JSBody(params = {"src", "srcOffset", "dst", "dstOffset", "n"}, script =
++        "new Uint8Array(dst.buffer, dst.byteOffset + dstOffset, n).set(new Uint8Array(src.buffer, src.byteOffset + srcOffset, n));")
++    private static native void copyArray(@JSByRef byte[] src, int srcOffset, @JSBuffer(JSBufferType.UINT8) Buffer dst, int dstOffset, int n);
++
++    @JSBody(params = {"src", "srcOffset", "dst", "dstOffset", "n"}, script =
++        "new Uint8Array(dst.buffer, dst.byteOffset + dstOffset, n).set(new Uint8Array(src.buffer, src.byteOffset + srcOffset, n));")
++    private static native void copyArray(@JSByRef short[] src, int srcOffset, @JSBuffer(JSBufferType.UINT8) Buffer dst, int dstOffset, int n);
++
++    @JSBody(params = {"src", "srcOffset", "dst", "dstOffset", "n"}, script =
++        "new Uint8Array(dst.buffer, dst.byteOffset + dstOffset, n).set(new Uint8Array(src.buffer, src.byteOffset + srcOffset, n));")
++    private static native void copyArray(@JSByRef int[] src, int srcOffset, @JSBuffer(JSBufferType.UINT8) Buffer dst, int dstOffset, int n);
++
++    @JSBody(params = {"src", "srcOffset", "dst", "dstOffset", "n"}, script =
++        "new Uint8Array(dst.buffer, dst.byteOffset + dstOffset, n).set(new Uint8Array(src.buffer, src.byteOffset + srcOffset, n));")
++    private static native void copyArray(@JSByRef float[] src, int srcOffset, @JSBuffer(JSBufferType.UINT8) Buffer dst, int dstOffset, int n);
++
++    @JSBody(params = {"src", "srcOffset", "dst", "dstOffset", "n"}, script =
++        "new Uint8Array(dst.buffer, dst.byteOffset + dstOffset, n).set(new Uint8Array(src.buffer, src.byteOffset + srcOffset, n));")
++    private static native void copyBuffer(@JSBuffer(JSBufferType.UINT8) Buffer src, int srcOffset, @JSBuffer(JSBufferType.UINT8) Buffer dst, int dstOffset, int n);
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/ModClassLoader.java b/port/web/src/main/java/mindustry/web/emu/ModClassLoader.java
+new file mode 100644
+index 0000000..305ce99
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/ModClassLoader.java
+@@ -0,0 +1,11 @@
++package mindustry.web.emu;
++
++/** Stands in for mindustry.mod.ModClassLoader; Java mods can't load in the browser. */
++public class ModClassLoader extends ClassLoader{
++    public ModClassLoader(ClassLoader parent){
++        super(parent);
++    }
++
++    public void addChild(ClassLoader child){
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/Platform$1.java b/port/web/src/main/java/mindustry/web/emu/Platform$1.java
+new file mode 100644
+index 0000000..9c9be35
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/Platform$1.java
+@@ -0,0 +1,10 @@
++package mindustry.web.emu;
++
++import java.net.*;
++
++/** Stands in for the jar class loader in mindustry.core.Platform#loadJar. */
++public class Platform$1 extends ClassLoader{
++    public Platform$1(mindustry.core.Platform platform, URL[] urls, ClassLoader loader, ClassLoader parent){
++        throw new UnsupportedOperationException("Java mods are not supported in the browser.");
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/Scripts.java b/port/web/src/main/java/mindustry/web/emu/Scripts.java
+new file mode 100644
+index 0000000..5590637
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/Scripts.java
+@@ -0,0 +1,41 @@
++package mindustry.web.emu;
++
++import arc.files.*;
++import arc.util.*;
++import arc.util.Log.*;
++import mindustry.mod.Mods.*;
++
++/** Stands in for mindustry.mod.Scripts: there is no JavaScript engine for mods in this build. */
++public class Scripts implements Disposable{
++    public boolean hasErrored(){
++        return false;
++    }
++
++    public String runConsole(String text){
++        return "Scripts are not available in the browser.";
++    }
++
++    public void log(String source, String message){
++        log(LogLevel.info, source, message);
++    }
++
++    public void log(LogLevel level, String source, String message){
++        Log.log(level, "[@]: @", source, message);
++    }
++
++    public float[] newFloats(int capacity){
++        return new float[capacity];
++    }
++
++    public Class<?> getClass(Object object){
++        return object.getClass();
++    }
++
++    public void run(LoadedMod mod, Fi file){
++        Log.warn("Skipping script @ from @: scripts are not available in the browser.", file.name(), mod.name);
++    }
++
++    @Override
++    public void dispose(){
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/Unsafe.java b/port/web/src/main/java/mindustry/web/emu/Unsafe.java
+new file mode 100644
+index 0000000..1e00ebe
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/Unsafe.java
+@@ -0,0 +1,21 @@
++package mindustry.web.emu;
++
++import java.lang.reflect.*;
++
++/** Stands in for sun.misc.Unsafe, which Arc probes for and falls back from when it fails. */
++public final class Unsafe{
++    private Unsafe(){
++    }
++
++    public long objectFieldOffset(Field field){
++        throw new UnsupportedOperationException();
++    }
++
++    public long getLong(Object o, long offset){
++        throw new UnsupportedOperationException();
++    }
++
++    public void copyMemory(long src, long dst, long bytes){
++        throw new UnsupportedOperationException();
++    }
++}
+diff --git a/port/web/src/main/java/mindustry/web/emu/WebNatives.java b/port/web/src/main/java/mindustry/web/emu/WebNatives.java
+new file mode 100644
+index 0000000..a00abac
+--- /dev/null
++++ b/port/web/src/main/java/mindustry/web/emu/WebNatives.java
+@@ -0,0 +1,12 @@
++package mindustry.web.emu;
++
++import arc.*;
++import arc.files.*;
++
++/** Helpers for the natives that read files: the wasm side has no file system, so they get the bytes. */
++public class WebNatives{
++    public static byte[] read(String path){
++        Fi file = path.startsWith("/") ? Core.files.absolute(path) : Core.files.internal(path);
++        return file.readBytes();
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/security/TDigestInputStream.java b/port/web/src/main/java/org/teavm/classlib/java/security/TDigestInputStream.java
+new file mode 100644
+index 0000000..7bda3e6
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/security/TDigestInputStream.java
+@@ -0,0 +1,36 @@
++package org.teavm.classlib.java.security;
++
++import java.io.FilterInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++public class TDigestInputStream extends FilterInputStream {
++    protected TMessageDigest digest;
++
++    public TDigestInputStream(InputStream stream, TMessageDigest digest) {
++        super(stream);
++        this.digest = digest;
++    }
++
++    @Override
++    public int read() throws IOException {
++        int b = in.read();
++        if (b >= 0) {
++            digest.update((byte) b);
++        }
++        return b;
++    }
++
++    @Override
++    public int read(byte[] b, int off, int len) throws IOException {
++        int n = in.read(b, off, len);
++        if (n > 0) {
++            digest.update(b, off, n);
++        }
++        return n;
++    }
++
++    public TMessageDigest getMessageDigest() {
++        return digest;
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/security/TMessageDigest.java b/port/web/src/main/java/org/teavm/classlib/java/security/TMessageDigest.java
+new file mode 100644
+index 0000000..6b7c937
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/security/TMessageDigest.java
+@@ -0,0 +1,137 @@
++package org.teavm.classlib.java.security;
++
++/** SHA-256 only, which is all the game asks for. */
++public class TMessageDigest {
++    private static final int[] K = {
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
++    };
++
++    private final String algorithm;
++    private final int[] h = new int[8];
++    private final byte[] block = new byte[64];
++    private final int[] w = new int[64];
++    private int blockLength;
++    private long total;
++
++    protected TMessageDigest(String algorithm) {
++        this.algorithm = algorithm;
++        reset();
++    }
++
++    public static TMessageDigest getInstance(String algorithm) throws TNoSuchAlgorithmException {
++        String name = algorithm.toUpperCase();
++        if (!name.equals("SHA-256") && !name.equals("SHA256")) {
++            throw new TNoSuchAlgorithmException(algorithm);
++        }
++        return new TMessageDigest("SHA-256");
++    }
++
++    public final String getAlgorithm() {
++        return algorithm;
++    }
++
++    public final int getDigestLength() {
++        return 32;
++    }
++
++    public void reset() {
++        h[0] = 0x6a09e667;
++        h[1] = 0xbb67ae85;
++        h[2] = 0x3c6ef372;
++        h[3] = 0xa54ff53a;
++        h[4] = 0x510e527f;
++        h[5] = 0x9b05688c;
++        h[6] = 0x1f83d9ab;
++        h[7] = 0x5be0cd19;
++        blockLength = 0;
++        total = 0;
++    }
++
++    public void update(byte input) {
++        block[blockLength++] = input;
++        total++;
++        if (blockLength == 64) {
++            compress();
++        }
++    }
++
++    public void update(byte[] input) {
++        update(input, 0, input.length);
++    }
++
++    public void update(byte[] input, int offset, int len) {
++        for (int i = 0; i < len; i++) {
++            update(input[offset + i]);
++        }
++    }
++
++    public byte[] digest(byte[] input) {
++        update(input);
++        return digest();
++    }
++
++    public byte[] digest() {
++        long bits = total * 8;
++        update((byte) 0x80);
++        while (blockLength != 56) {
++            update((byte) 0);
++        }
++        for (int i = 7; i >= 0; i--) {
++            update((byte) (bits >>> (i * 8)));
++        }
++        byte[] out = new byte[32];
++        for (int i = 0; i < 8; i++) {
++            out[i * 4] = (byte) (h[i] >>> 24);
++            out[i * 4 + 1] = (byte) (h[i] >>> 16);
++            out[i * 4 + 2] = (byte) (h[i] >>> 8);
++            out[i * 4 + 3] = (byte) h[i];
++        }
++        reset();
++        return out;
++    }
++
++    private void compress() {
++        for (int i = 0; i < 16; i++) {
++            w[i] = ((block[i * 4] & 0xff) << 24) | ((block[i * 4 + 1] & 0xff) << 16)
++                    | ((block[i * 4 + 2] & 0xff) << 8) | (block[i * 4 + 3] & 0xff);
++        }
++        for (int i = 16; i < 64; i++) {
++            int s0 = Integer.rotateRight(w[i - 15], 7) ^ Integer.rotateRight(w[i - 15], 18) ^ (w[i - 15] >>> 3);
++            int s1 = Integer.rotateRight(w[i - 2], 17) ^ Integer.rotateRight(w[i - 2], 19) ^ (w[i - 2] >>> 10);
++            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++        }
++        int a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
++        for (int i = 0; i < 64; i++) {
++            int s1 = Integer.rotateRight(e, 6) ^ Integer.rotateRight(e, 11) ^ Integer.rotateRight(e, 25);
++            int ch = (e & f) ^ (~e & g);
++            int t1 = hh + s1 + ch + K[i] + w[i];
++            int s0 = Integer.rotateRight(a, 2) ^ Integer.rotateRight(a, 13) ^ Integer.rotateRight(a, 22);
++            int maj = (a & b) ^ (a & c) ^ (b & c);
++            int t2 = s0 + maj;
++            hh = g;
++            g = f;
++            f = e;
++            e = d + t1;
++            d = c;
++            c = b;
++            b = a;
++            a = t1 + t2;
++        }
++        h[0] += a;
++        h[1] += b;
++        h[2] += c;
++        h[3] += d;
++        h[4] += e;
++        h[5] += f;
++        h[6] += g;
++        h[7] += hh;
++        blockLength = 0;
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/text/TStringCharacterIterator.java b/port/web/src/main/java/org/teavm/classlib/java/text/TStringCharacterIterator.java
+new file mode 100644
+index 0000000..45d3db4
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/text/TStringCharacterIterator.java
+@@ -0,0 +1,83 @@
++package org.teavm.classlib.java.text;
++
++public final class TStringCharacterIterator implements TCharacterIterator {
++    private final String text;
++    private final int begin;
++    private final int end;
++    private int pos;
++
++    public TStringCharacterIterator(String text) {
++        this(text, 0, text.length(), 0);
++    }
++
++    public TStringCharacterIterator(String text, int pos) {
++        this(text, 0, text.length(), pos);
++    }
++
++    public TStringCharacterIterator(String text, int begin, int end, int pos) {
++        this.text = text;
++        this.begin = begin;
++        this.end = end;
++        this.pos = pos;
++    }
++
++    @Override
++    public Object clone() {
++        return new TStringCharacterIterator(text, begin, end, pos);
++    }
++
++    @Override
++    public char current() {
++        return pos >= begin && pos < end ? text.charAt(pos) : DONE;
++    }
++
++    @Override
++    public char first() {
++        pos = begin;
++        return current();
++    }
++
++    @Override
++    public int getBeginIndex() {
++        return begin;
++    }
++
++    @Override
++    public int getEndIndex() {
++        return end;
++    }
++
++    @Override
++    public int getIndex() {
++        return pos;
++    }
++
++    @Override
++    public char last() {
++        pos = end > begin ? end - 1 : end;
++        return current();
++    }
++
++    @Override
++    public char next() {
++        if (pos < end) {
++            pos++;
++        }
++        return current();
++    }
++
++    @Override
++    public char previous() {
++        if (pos <= begin) {
++            return DONE;
++        }
++        pos--;
++        return current();
++    }
++
++    @Override
++    public char setIndex(int location) {
++        pos = location;
++        return current();
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TAbstractExecutorService.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TAbstractExecutorService.java
+new file mode 100644
+index 0000000..b214e81
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TAbstractExecutorService.java
+@@ -0,0 +1,88 @@
++package org.teavm.classlib.java.util.concurrent;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * Executors in the browser build run each task on the caller, at once. The game only uses pools
++ * for background work it then waits for, so this keeps its results and order.
++ */
++public abstract class TAbstractExecutorService implements TExecutorService {
++    boolean shutdown;
++
++    @Override
++    public void execute(org.teavm.classlib.java.lang.TRunnable command) {
++        if (shutdown) {
++            throw new TRejectedExecutionException();
++        }
++        try {
++            command.run();
++        } catch (Throwable t) {
++            Thread.UncaughtExceptionHandler handler = Thread.getDefaultUncaughtExceptionHandler();
++            if (handler != null) {
++                handler.uncaughtException(Thread.currentThread(), t);
++            } else {
++                t.printStackTrace();
++            }
++        }
++    }
++
++    @Override
++    public <T> TFuture<T> submit(java.util.concurrent.Callable<T> task) {
++        if (shutdown) {
++            throw new TRejectedExecutionException();
++        }
++        return TCompletedFuture.run(task);
++    }
++
++    @Override
++    public <T> TFuture<T> submit(Runnable task, T result) {
++        java.util.concurrent.Callable<T> callable = () -> {
++            task.run();
++            return result;
++        };
++        return submit(callable);
++    }
++
++    @Override
++    public TFuture<?> submit(Runnable task) {
++        return submit(task, null);
++    }
++
++    @Override
++    public <T> List<TFuture<T>> invokeAll(Collection<? extends java.util.concurrent.Callable<T>> tasks) {
++        List<TFuture<T>> out = new ArrayList<>();
++        for (java.util.concurrent.Callable<T> task : tasks) {
++            out.add(submit(task));
++        }
++        return out;
++    }
++
++    @Override
++    public void shutdown() {
++        shutdown = true;
++    }
++
++    @Override
++    public List<Runnable> shutdownNow() {
++        shutdown = true;
++        return Collections.emptyList();
++    }
++
++    @Override
++    public boolean isShutdown() {
++        return shutdown;
++    }
++
++    @Override
++    public boolean isTerminated() {
++        return shutdown;
++    }
++
++    @Override
++    public boolean awaitTermination(long timeout, TTimeUnit unit) {
++        return true;
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TCompletedFuture.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TCompletedFuture.java
+new file mode 100644
+index 0000000..1b1ae63
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TCompletedFuture.java
+@@ -0,0 +1,48 @@
++package org.teavm.classlib.java.util.concurrent;
++
++/** Result of a task that already ran: the browser build runs pool tasks on the caller. */
++class TCompletedFuture<V> implements TFuture<V> {
++    private final V value;
++    private final Throwable error;
++
++    TCompletedFuture(V value, Throwable error) {
++        this.value = value;
++        this.error = error;
++    }
++
++    static <V> TCompletedFuture<V> run(java.util.concurrent.Callable<V> task) {
++        try {
++            return new TCompletedFuture<>(task.call(), null);
++        } catch (Throwable t) {
++            return new TCompletedFuture<>(null, t);
++        }
++    }
++
++    @Override
++    public boolean cancel(boolean mayInterruptIfRunning) {
++        return false;
++    }
++
++    @Override
++    public boolean isCancelled() {
++        return false;
++    }
++
++    @Override
++    public boolean isDone() {
++        return true;
++    }
++
++    @Override
++    public V get() throws TExecutionException {
++        if (error != null) {
++            throw new TExecutionException(error);
++        }
++        return value;
++    }
++
++    @Override
++    public V get(long timeout, TTimeUnit unit) throws TExecutionException {
++        return get();
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TCountDownLatch.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TCountDownLatch.java
+new file mode 100644
+index 0000000..542c95b
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TCountDownLatch.java
+@@ -0,0 +1,32 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TCountDownLatch {
++    private long count;
++
++    public TCountDownLatch(int count) {
++        this.count = count;
++    }
++
++    public synchronized void countDown() {
++        if (count > 0 && --count == 0) {
++            notifyAll();
++        }
++    }
++
++    public long getCount() {
++        return count;
++    }
++
++    public synchronized void await() throws InterruptedException {
++        while (count > 0) {
++            wait();
++        }
++    }
++
++    public synchronized boolean await(long timeout, TTimeUnit unit) throws InterruptedException {
++        if (count > 0) {
++            wait(Math.max(1, unit.toMillis(timeout)));
++        }
++        return count == 0;
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TExecutorService.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TExecutorService.java
+new file mode 100644
+index 0000000..9311785
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TExecutorService.java
+@@ -0,0 +1,29 @@
++package org.teavm.classlib.java.util.concurrent;
++
++import java.util.Collection;
++import java.util.List;
++
++public interface TExecutorService extends TExecutor, AutoCloseable {
++    void shutdown();
++
++    List<Runnable> shutdownNow();
++
++    boolean isShutdown();
++
++    boolean isTerminated();
++
++    boolean awaitTermination(long timeout, TTimeUnit unit) throws InterruptedException;
++
++    <T> TFuture<T> submit(java.util.concurrent.Callable<T> task);
++
++    <T> TFuture<T> submit(Runnable task, T result);
++
++    TFuture<?> submit(Runnable task);
++
++    <T> List<TFuture<T>> invokeAll(Collection<? extends java.util.concurrent.Callable<T>> tasks) throws InterruptedException;
++
++    @Override
++    default void close() {
++        shutdown();
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TExecutors.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TExecutors.java
+new file mode 100644
+index 0000000..64559b0
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TExecutors.java
+@@ -0,0 +1,41 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public final class TExecutors {
++    private TExecutors() {
++    }
++
++    static class Direct extends TAbstractExecutorService implements TScheduledExecutorService {
++    }
++
++    public static TExecutorService newFixedThreadPool(int threads) {
++        return new Direct();
++    }
++
++    public static TExecutorService newFixedThreadPool(int threads, TThreadFactory factory) {
++        return new Direct();
++    }
++
++    public static TExecutorService newSingleThreadExecutor() {
++        return new Direct();
++    }
++
++    public static TExecutorService newSingleThreadExecutor(TThreadFactory factory) {
++        return new Direct();
++    }
++
++    public static TExecutorService newCachedThreadPool() {
++        return new Direct();
++    }
++
++    public static TExecutorService newCachedThreadPool(TThreadFactory factory) {
++        return new Direct();
++    }
++
++    public static TScheduledExecutorService newScheduledThreadPool(int threads) {
++        return new Direct();
++    }
++
++    public static TExecutorService newWorkStealingPool() {
++        return new Direct();
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TForkJoinPool.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TForkJoinPool.java
+new file mode 100644
+index 0000000..161a101
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TForkJoinPool.java
+@@ -0,0 +1,34 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TForkJoinPool extends TAbstractExecutorService {
++    private static final TForkJoinPool common = new TForkJoinPool();
++
++    public static TForkJoinPool commonPool() {
++        return common;
++    }
++
++    public <T> T invoke(TForkJoinTask<T> task) {
++        return task.invoke();
++    }
++
++    public void execute(TForkJoinTask<?> task) {
++        task.invoke();
++    }
++
++    @Override
++    public TForkJoinTask<?> submit(Runnable task) {
++        TForkJoinTask<Void> wrapped = new TRecursiveAction() {
++            @Override
++            protected void compute() {
++                task.run();
++            }
++        };
++        wrapped.invoke();
++        return wrapped;
++    }
++
++    public <T> TForkJoinTask<T> submit(TForkJoinTask<T> task) {
++        task.invoke();
++        return task;
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TForkJoinTask.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TForkJoinTask.java
+new file mode 100644
+index 0000000..e300be8
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TForkJoinTask.java
+@@ -0,0 +1,65 @@
++package org.teavm.classlib.java.util.concurrent;
++
++/** Runs on the caller, like the other browser executors. */
++public abstract class TForkJoinTask<V> implements TFuture<V> {
++    private boolean done;
++
++    protected abstract boolean exec();
++
++    public abstract V getRawResult();
++
++    protected abstract void setRawResult(V value);
++
++    public final V invoke() {
++        if (!done) {
++            exec();
++            done = true;
++        }
++        return getRawResult();
++    }
++
++    public final TForkJoinTask<V> fork() {
++        invoke();
++        return this;
++    }
++
++    public final V join() {
++        return invoke();
++    }
++
++    public static void invokeAll(TForkJoinTask<?> a, TForkJoinTask<?> b) {
++        a.invoke();
++        b.invoke();
++    }
++
++    public static void invokeAll(TForkJoinTask<?>... tasks) {
++        for (TForkJoinTask<?> task : tasks) {
++            task.invoke();
++        }
++    }
++
++    @Override
++    public boolean cancel(boolean mayInterruptIfRunning) {
++        return false;
++    }
++
++    @Override
++    public boolean isCancelled() {
++        return false;
++    }
++
++    @Override
++    public boolean isDone() {
++        return done;
++    }
++
++    @Override
++    public V get() {
++        return invoke();
++    }
++
++    @Override
++    public V get(long timeout, TTimeUnit unit) {
++        return invoke();
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TFuture.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TFuture.java
+new file mode 100644
+index 0000000..7534168
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TFuture.java
+@@ -0,0 +1,13 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public interface TFuture<V> {
++    boolean cancel(boolean mayInterruptIfRunning);
++
++    boolean isCancelled();
++
++    boolean isDone();
++
++    V get() throws InterruptedException, TExecutionException;
++
++    V get(long timeout, TTimeUnit unit) throws InterruptedException, TExecutionException, TTimeoutException;
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TLinkedBlockingQueue.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TLinkedBlockingQueue.java
+new file mode 100644
+index 0000000..f3cbb1e
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TLinkedBlockingQueue.java
+@@ -0,0 +1,7 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TLinkedBlockingQueue<E> extends TArrayBlockingQueue<E> {
++    public TLinkedBlockingQueue() {
++        super(1 << 16);
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TRecursiveAction.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TRecursiveAction.java
+new file mode 100644
+index 0000000..c8f398c
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TRecursiveAction.java
+@@ -0,0 +1,20 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public abstract class TRecursiveAction extends TForkJoinTask<Void> {
++    protected abstract void compute();
++
++    @Override
++    protected final boolean exec() {
++        compute();
++        return true;
++    }
++
++    @Override
++    public final Void getRawResult() {
++        return null;
++    }
++
++    @Override
++    protected final void setRawResult(Void value) {
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TRejectedExecutionException.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TRejectedExecutionException.java
+new file mode 100644
+index 0000000..93f4783
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TRejectedExecutionException.java
+@@ -0,0 +1,10 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TRejectedExecutionException extends RuntimeException {
++    public TRejectedExecutionException() {
++    }
++
++    public TRejectedExecutionException(String message) {
++        super(message);
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TScheduledExecutorService.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TScheduledExecutorService.java
+new file mode 100644
+index 0000000..3ed6cbe
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TScheduledExecutorService.java
+@@ -0,0 +1,4 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public interface TScheduledExecutorService extends TExecutorService {
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TSynchronousQueue.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TSynchronousQueue.java
+new file mode 100644
+index 0000000..c6537d2
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TSynchronousQueue.java
+@@ -0,0 +1,7 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TSynchronousQueue<E> extends TArrayBlockingQueue<E> {
++    public TSynchronousQueue() {
++        super(1);
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TThreadFactory.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TThreadFactory.java
+new file mode 100644
+index 0000000..4d5fadc
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TThreadFactory.java
+@@ -0,0 +1,5 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public interface TThreadFactory {
++    Thread newThread(Runnable r);
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TThreadPoolExecutor.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TThreadPoolExecutor.java
+new file mode 100644
+index 0000000..1c33efb
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TThreadPoolExecutor.java
+@@ -0,0 +1,18 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TThreadPoolExecutor extends TAbstractExecutorService {
++    public TThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TTimeUnit unit,
++            TBlockingQueue<Runnable> workQueue) {
++    }
++
++    public TThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TTimeUnit unit,
++            TBlockingQueue<Runnable> workQueue, TThreadFactory threadFactory) {
++    }
++
++    public void allowCoreThreadTimeOut(boolean value) {
++    }
++
++    public int getActiveCount() {
++        return 0;
++    }
++}
+diff --git a/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TTimeoutException.java b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TTimeoutException.java
+new file mode 100644
+index 0000000..16351c9
+--- /dev/null
++++ b/port/web/src/main/java/org/teavm/classlib/java/util/concurrent/TTimeoutException.java
+@@ -0,0 +1,10 @@
++package org.teavm.classlib.java.util.concurrent;
++
++public class TTimeoutException extends Exception {
++    public TTimeoutException() {
++    }
++
++    public TTimeoutException(String message) {
++        super(message);
++    }
++}
+diff --git a/port/web/src/main/resources/META-INF/services/org.teavm.extension.spi.reflection.ReflectionPolicy b/port/web/src/main/resources/META-INF/services/org.teavm.extension.spi.reflection.ReflectionPolicy
+new file mode 100644
+index 0000000..f69dace
+--- /dev/null
++++ b/port/web/src/main/resources/META-INF/services/org.teavm.extension.spi.reflection.ReflectionPolicy
+@@ -0,0 +1 @@
++mindustry.web.WebReflection
+diff --git a/port/web/src/main/resources/META-INF/services/org.teavm.extension.spi.substitution.SubstitutionPolicy b/port/web/src/main/resources/META-INF/services/org.teavm.extension.spi.substitution.SubstitutionPolicy
+new file mode 100644
+index 0000000..ed109c5
+--- /dev/null
++++ b/port/web/src/main/resources/META-INF/services/org.teavm.extension.spi.substitution.SubstitutionPolicy
+@@ -0,0 +1 @@
++mindustry.web.WebSubstitutions
+diff --git a/port/web/src/main/resources/META-INF/services/org.teavm.vm.spi.TeaVMPlugin b/port/web/src/main/resources/META-INF/services/org.teavm.vm.spi.TeaVMPlugin
+new file mode 100644
+index 0000000..6993d5b
+--- /dev/null
++++ b/port/web/src/main/resources/META-INF/services/org.teavm.vm.spi.TeaVMPlugin
+@@ -0,0 +1 @@
++mindustry.web.WebPlugin
