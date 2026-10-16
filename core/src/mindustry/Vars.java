@@ -514,7 +514,13 @@ public class Vars implements Loadable{
             settings.put("uiscale", 100);
         }
 
-        Scl.setProduct(Math.max(settings.getInt("uiscale", 100), 25) / 100f);
+        float uiscale = Math.max(settings.getInt("uiscale", 100), 25) / 100f;
+        if(OS.isWeb){
+            //the browser build works in physical pixels: follow the screen's pixel ratio, a little smaller in a small window
+            float density = Core.graphics.getDensity();
+            uiscale *= density * arc.math.Mathf.clamp(Math.min(Core.graphics.getWidth() / density / 1100f, Core.graphics.getHeight() / density / 700f), 0.7f, 1f);
+        }
+        Scl.setProduct(uiscale);
 
         if(!loadLocales) return;
 

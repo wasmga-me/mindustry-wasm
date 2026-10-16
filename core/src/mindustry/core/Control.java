@@ -687,7 +687,7 @@ public class Control implements ApplicationListener, Loadable{
 
         sound.update();
 
-        if(Core.input.keyTap(Binding.fullscreen)){
+        if(!arc.util.OS.isWeb && Core.input.keyTap(Binding.fullscreen)){
             boolean full = settings.getBool("fullscreen");
             graphics.setFullscreen(!full);
             settings.put("fullscreen", !full);

@@ -152,10 +152,13 @@ public class MenuFragment{
 
         Seq<MobileButton> customs = customButtons.map(b -> new MobileButton(b.icon, b.text, b.runnable == null ? () -> {} : b.runnable));
 
+        //no sockets, mod code or quitting in a browser
+        boolean web = arc.util.OS.isWeb;
+
         if(!Core.graphics.isPortrait()){
             container.marginTop(60f);
             container.add(play);
-            container.add(join);
+            if(!web) container.add(join);
             container.add(custom);
             container.add(maps);
             // add odd custom buttons
@@ -166,30 +169,30 @@ public class MenuFragment{
 
             container.add(editor);
             container.add(tools);
-            container.add(mods);
+            if(!web) container.add(mods);
             // add even custom buttons (before the exit button)
             for(int i = 0; i < customs.size; i += 2){
                 container.add(customs.get(i));
             }
-            container.add(ios ? about : exit);
+            container.add(ios || web ? about : exit);
         }else{
             container.marginTop(0f);
             container.add(play);
             container.add(maps);
             container.row();
             container.add(custom);
-            container.add(join);
+            if(!web) container.add(join);
             container.row();
             container.add(editor);
             container.add(tools);
             container.row();
-            container.add(mods);
+            if(!web) container.add(mods);
             // add custom buttons
             for(int i = 0; i < customs.size; i++){
                 container.add(customs.get(i));
                 if(i % 2 == 0) container.row();
             }
-            container.add(ios ? about : exit);
+            container.add(ios || web ? about : exit);
         }
     }
 
@@ -210,7 +213,8 @@ public class MenuFragment{
                 desktopButtons = Seq.with(
                     new MenuButton("@play", Icon.play,
                         new MenuButton("@campaign", Icon.play, () -> checkPlay(ui.planet::show)),
-                        new MenuButton("@joingame", Icon.add, () -> checkPlay(ui.join::show)),
+                        //no sockets in a browser
+                        arc.util.OS.isWeb ? null : new MenuButton("@joingame", Icon.add, () -> checkPlay(ui.join::show)),
                         new MenuButton("@customgame", Icon.terrain, () -> checkPlay(ui.custom::show)),
                         new MenuButton("@loadgame", Icon.download, () -> checkPlay(ui.load::show))
                     ),
@@ -220,14 +224,15 @@ public class MenuFragment{
                         new MenuButton("@about.button", Icon.info, ui.about::show)
                     ),
                     new MenuButton("@editor", Icon.terrain, () -> checkPlay(ui.maps::show)), steam ? new MenuButton("@workshop", Icon.steam, platform::openWorkshop) : null,
-                    new MenuButton("@mods", Icon.book, ui.mods::show),
+                    arc.util.OS.isWeb ? null : new MenuButton("@mods", Icon.book, ui.mods::show),
                     new MenuButton("@settings", Icon.settings, ui.settings::show)
                 );
             }
 
             buttons(t, desktopButtons.toArray(MenuButton.class));
             buttons(t, customButtons.toArray(MenuButton.class));
-            buttons(t, new MenuButton("@quit", Icon.exit, Core.app::exit));
+            //a page can't close itself
+            if(!arc.util.OS.isWeb) buttons(t, new MenuButton("@quit", Icon.exit, Core.app::exit));
         }).width(width).growY();
 
         container.table(background, t -> {

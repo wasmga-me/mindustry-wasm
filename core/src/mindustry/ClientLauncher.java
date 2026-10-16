@@ -219,7 +219,8 @@ public abstract class ClientLauncher extends ApplicationCore implements Platform
 
         int targetfps = ios ? 0 : Core.settings.getInt("fpscap", 120);
         boolean changed = lastTargetFps != targetfps && lastTargetFps != -1;
-        boolean limitFps = targetfps > 0 && targetfps <= 240;
+        //the browser paces frames itself
+        boolean limitFps = targetfps > 0 && targetfps <= 240 && !OS.isWeb;
 
         lastTargetFps = targetfps;
 

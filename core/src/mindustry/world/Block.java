@@ -404,6 +404,8 @@ public class Block extends UnlockableContent implements Senseable{
     /** Building that is created for this block. Initialized in init() via reflection. Set manually if modded. */
     @NoPatch
     public Prov<Building> buildType = null;
+    /** Set by the browser build: finds the building type without reflection. */
+    public static @Nullable Func<Block, Prov<Building>> webBuildTypes;
     /** Configuration handlers by type. */
     @NoPatch
     public ObjectMap<Class<?>, Cons2> configurations = new ObjectMap<>();
@@ -1251,6 +1253,9 @@ public class Block extends UnlockableContent implements Senseable{
             }
 
             subclass = current;
+
+            //the browser build can't list declared classes; it sets a lookup generated at build time
+            if(webBuildTypes != null) buildType = webBuildTypes.get(this);
 
             while(buildType == null && Block.class.isAssignableFrom(current)){
                 //first class that is subclass of Building

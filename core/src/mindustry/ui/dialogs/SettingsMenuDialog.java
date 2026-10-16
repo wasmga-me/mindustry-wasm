@@ -275,7 +275,8 @@ public class SettingsMenuDialog extends BaseDialog{
                 }
             }))).marginLeft(4);
 
-            if(!mobile){
+            //a page can't open a folder
+            if(!mobile && !arc.util.OS.isWeb){
                 t.row();
                 t.button("@data.openfolder", Icon.folder, style, () -> Core.app.openFolder(Core.settings.getDataDirectory().absolutePath())).marginLeft(4);
             }
@@ -480,13 +481,16 @@ public class SettingsMenuDialog extends BaseDialog{
         });
 
         if(!mobile){
-            graphics.checkPref("vsync", true, b -> Core.graphics.setVSync(b));
-            graphics.checkPref("fullscreen", false, b -> Core.graphics.setFullscreen(b));
+            //in a browser the page owns full screen and the frame rate
+            if(!arc.util.OS.isWeb){
+                graphics.checkPref("vsync", true, b -> Core.graphics.setVSync(b));
+                graphics.checkPref("fullscreen", false, b -> Core.graphics.setFullscreen(b));
 
-            Core.graphics.setVSync(Core.settings.getBool("vsync"));
+                Core.graphics.setVSync(Core.settings.getBool("vsync"));
 
-            if(Core.settings.getBool("fullscreen")){
-                Core.app.post(() -> Core.graphics.setFullscreen(true));
+                if(Core.settings.getBool("fullscreen")){
+                    Core.app.post(() -> Core.graphics.setFullscreen(true));
+                }
             }
         }else if(!ios){
             graphics.checkPref("landscape", false, b -> {

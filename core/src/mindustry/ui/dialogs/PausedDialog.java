@@ -95,7 +95,8 @@ public class PausedDialog extends BaseDialog{
             cont.row();
 
             //the button runs out of space when the editor button is added, so use the mobile text
-            cont.button(state.isEditor() ? "@hostserver.mobile" : "@hostserver", Icon.host, () -> {
+            //(no sockets in a browser, so no hosting there)
+            if(!arc.util.OS.isWeb) cont.button(state.isEditor() ? "@hostserver.mobile" : "@hostserver", Icon.host, () -> {
                 if(net.server() && steam){
                     platform.inviteFriends();
                 }else{
@@ -149,7 +150,7 @@ public class PausedDialog extends BaseDialog{
                 cont.row();
             }
 
-            cont.buttonRow("@hostserver.mobile", Icon.host, ui.host::show).disabled(b -> net.active());
+            if(!arc.util.OS.isWeb) cont.buttonRow("@hostserver.mobile", Icon.host, ui.host::show).disabled(b -> net.active());
 
             cont.buttonRow("@quit", Icon.exit, this::showQuitConfirm).update(s -> {
                 s.setText(control.saves.getCurrent() != null && control.saves.getCurrent().isAutosave() ? "@save.quit" : "@quit");
